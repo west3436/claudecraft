@@ -1,0 +1,78 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '6.0.+'
+}
+
+version = '1.0.0'
+group = 'com.claudecraft'
+archivesBaseName = 'claudecraft'
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+minecraft {
+    mappings channel: 'official', version: '1.20.1'
+
+    runs {
+        client {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                claudecraft {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        server {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                claudecraft {
+                    source sourceSets.main
+                }
+            }
+        }
+    }
+}
+
+repositories {
+    maven {
+        url "https://maven.squiddev.cc"
+        content {
+            includeGroup("cc.tweaked")
+        }
+    }
+    mavenCentral()
+}
+
+dependencies {
+    minecraft 'net.minecraftforge:forge:1.20.1-47.2.0'
+
+    // CC: Tweaked API
+    compileOnly "cc.tweaked:cc-tweaked-1.20.1-forge-api:1.117.1"
+    compileOnly "cc.tweaked:cc-tweaked-1.20.1-core-api:1.117.1"
+    runtimeOnly "cc.tweaked:cc-tweaked-1.20.1-forge:1.117.1"
+
+    // Gson for JSON (bundled with Minecraft, declared for compile)
+    compileOnly "com.google.code.gson:gson:2.10.1"
+}
+
+jar {
+    manifest {
+        attributes([
+            "Specification-Title"     : "ClaudeCraft",
+            "Specification-Vendor"    : "ClaudeCraft",
+            "Specification-Version"   : "1",
+            "Implementation-Title"    : project.name,
+            "Implementation-Version"  : project.jar.archiveVersion,
+            "Implementation-Vendor"   : "ClaudeCraft",
+            "Implementation-Timestamp": new Date().format("yyyy-MM-dd'T'HH:mm:ssZ")
+        ])
+    }
+}
+
+jar.finalizedBy('reobfJar')
