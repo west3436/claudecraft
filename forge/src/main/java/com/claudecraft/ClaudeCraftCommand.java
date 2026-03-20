@@ -31,7 +31,7 @@ public class ClaudeCraftCommand {
                                     ClaudeCraftConfig.API_KEY.set(key);
                                     ClaudeCraftConfig.API_KEY.save();
                                     ctx.getSource().sendSuccess(
-                                            () -> Component.literal("API key set successfully. ClaudeCraft is ready."),
+                                            Component.literal("API key set successfully. ClaudeCraft is ready."),
                                             false);
                                     ClaudeCraft.LOGGER.info("ClaudeCraft API key updated by {}",
                                             ctx.getSource().getTextName());
@@ -44,7 +44,7 @@ public class ClaudeCraftCommand {
                                     ClaudeCraftConfig.MODEL.set(model);
                                     ClaudeCraftConfig.MODEL.save();
                                     ctx.getSource().sendSuccess(
-                                            () -> Component.literal("Model set to: " + model), false);
+                                            Component.literal("Model set to: " + model), false);
                                     return 1;
                                 })))
                 .then(Commands.literal("status")
@@ -53,7 +53,7 @@ public class ClaudeCraftCommand {
                             String model = ClaudeCraftConfig.MODEL.get();
                             int maxTokens = ClaudeCraftConfig.MAX_TOKENS.get();
                             ctx.getSource().sendSuccess(
-                                    () -> Component.literal(String.format(
+                                    Component.literal(String.format(
                                             "ClaudeCraft Status:\n  API Key: %s\n  Model: %s\n  Max Tokens: %d",
                                             configured ? "configured" : "NOT SET",
                                             model, maxTokens)),
