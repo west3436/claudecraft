@@ -5,28 +5,23 @@ import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.io.*;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Handles HTTP communication with the Claude API using SSE streaming.
- * Uses Java 17's built-in HttpClient — no external dependencies.
+ * Uses HttpURLConnection for Java 8 compatibility.
  * Thread-safe. Shared across all AI Modem peripherals.
  */
 public class ClaudeApiClient {
     private static final String API_URL = "https://api.anthropic.com/v1/messages";
     private static final String API_VERSION = "2023-06-01";
     private static ClaudeApiClient INSTANCE;
-    private final HttpClient httpClient;
     private final ExecutorService executor;
     private final AtomicInteger activeRequests = new AtomicInteger(0);
 
@@ -36,10 +31,6 @@ public class ClaudeApiClient {
             t.setDaemon(true);
             return t;
         });
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(15))
-                .executor(executor)
-                .build();
     }
 
     public static synchronized ClaudeApiClient getInstance() {
@@ -110,28 +101,37 @@ public class ClaudeApiClient {
         body.addProperty("stream", true);
 
         int timeout = ClaudeCraftConfig.REQUEST_TIMEOUT_SECONDS.get();
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(API_URL))
-                .timeout(Duration.ofSeconds(timeout))
-                .header("x-api-key", apiKey)
-                .header("anthropic-version", API_VERSION)
-                .header("content-type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
-                .build();
+        String bodyString = body.toString();
 
         activeRequests.incrementAndGet();
 
         executor.submit(() -> {
             handle.requestThread = Thread.currentThread();
+            HttpURLConnection connection = null;
             try {
-                // Send request and get streaming response
-                HttpResponse<java.io.InputStream> response = httpClient.send(
-                        request, HttpResponse.BodyHandlers.ofInputStream());
+                URL url = new URL(API_URL);
+                connection = (HttpURLConnection) url.openConnection();
+                connection.setRequestMethod("POST");
+                connection.setDoOutput(true);
+                connection.setConnectTimeout(15000);
+                connection.setReadTimeout(timeout * 1000);
+                connection.setRequestProperty("x-api-key", apiKey);
+                connection.setRequestProperty("anthropic-version", API_VERSION);
+                connection.setRequestProperty("content-type", "application/json");
 
-                if (response.statusCode() != 200) {
-                    String errorBody = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
-                    String msg = "HTTP " + response.statusCode();
+                // Write request body
+                byte[] bodyBytes = bodyString.getBytes(StandardCharsets.UTF_8);
+                connection.setFixedLengthStreamingMode(bodyBytes.length);
+                try (OutputStream os = connection.getOutputStream()) {
+                    os.write(bodyBytes);
+                    os.flush();
+                }
+
+                int statusCode = connection.getResponseCode();
+                if (statusCode != 200) {
+                    InputStream errorStream = connection.getErrorStream();
+                    String errorBody = readFullStream(errorStream != null ? errorStream : connection.getInputStream());
+                    String msg = "HTTP " + statusCode;
                     try {
                         JsonObject err = JsonParser.parseString(errorBody).getAsJsonObject();
                         if (err.has("error")) {
@@ -148,7 +148,7 @@ public class ClaudeApiClient {
                 }
 
                 // Parse SSE stream line-by-line
-                parseSSEStream(response.body(), handle, callbacks);
+                parseSSEStream(connection.getInputStream(), handle, callbacks);
 
             } catch (InterruptedException e) {
                 if (!handle.isCancelled()) {
@@ -161,6 +161,9 @@ public class ClaudeApiClient {
             } finally {
                 activeRequests.decrementAndGet();
                 handle.requestThread = null;
+                if (connection != null) {
+                    connection.disconnect();
+                }
             }
         });
 
@@ -168,10 +171,23 @@ public class ClaudeApiClient {
     }
 
     /**
+     * Read an entire InputStream into a String.
+     */
+    private static String readFullStream(InputStream stream) throws IOException {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int length;
+        while ((length = stream.read(buffer)) != -1) {
+            result.write(buffer, 0, length);
+        }
+        return result.toString(StandardCharsets.UTF_8.name());
+    }
+
+    /**
      * Parse an SSE stream from the Claude API.
      * SSE format: lines of "event: <type>\ndata: <json>\n\n"
      */
-    private void parseSSEStream(java.io.InputStream inputStream, StreamHandle handle,
+    private void parseSSEStream(InputStream inputStream, StreamHandle handle,
                                  StreamCallbacks callbacks) throws Exception {
         // Track current tool_use block being streamed
         String currentToolId = null;
@@ -201,78 +217,70 @@ public class ClaudeApiClient {
                         try {
                             JsonObject json = JsonParser.parseString(data).getAsJsonObject();
 
-                            switch (eventType) {
-                                case "message_start" -> {
-                                    JsonObject message = json.getAsJsonObject("message");
-                                    if (message != null && message.has("usage")) {
-                                        JsonObject usage = message.getAsJsonObject("usage");
-                                        if (usage.has("input_tokens")) {
-                                            inputTokens = usage.get("input_tokens").getAsInt();
+                            if ("message_start".equals(eventType)) {
+                                JsonObject message = json.getAsJsonObject("message");
+                                if (message != null && message.has("usage")) {
+                                    JsonObject usage = message.getAsJsonObject("usage");
+                                    if (usage.has("input_tokens")) {
+                                        inputTokens = usage.get("input_tokens").getAsInt();
+                                    }
+                                }
+                            } else if ("content_block_start".equals(eventType)) {
+                                JsonObject block = json.getAsJsonObject("content_block");
+                                if (block != null && "tool_use".equals(
+                                        block.get("type").getAsString())) {
+                                    currentToolId = block.get("id").getAsString();
+                                    currentToolName = block.get("name").getAsString();
+                                    currentToolInput.setLength(0);
+                                    callbacks.onToolUseStart(currentToolId, currentToolName);
+                                }
+                            } else if ("content_block_delta".equals(eventType)) {
+                                JsonObject delta = json.getAsJsonObject("delta");
+                                if (delta != null) {
+                                    String deltaType = delta.get("type").getAsString();
+                                    if ("text_delta".equals(deltaType)) {
+                                        callbacks.onTextDelta(
+                                                delta.get("text").getAsString());
+                                    } else if ("input_json_delta".equals(deltaType)) {
+                                        String partial = delta.get("partial_json")
+                                                .getAsString();
+                                        currentToolInput.append(partial);
+                                        if (currentToolId != null) {
+                                            callbacks.onToolUseDelta(currentToolId, partial);
                                         }
                                     }
                                 }
-                                case "content_block_start" -> {
-                                    JsonObject block = json.getAsJsonObject("content_block");
-                                    if (block != null && "tool_use".equals(
-                                            block.get("type").getAsString())) {
-                                        currentToolId = block.get("id").getAsString();
-                                        currentToolName = block.get("name").getAsString();
-                                        currentToolInput.setLength(0);
-                                        callbacks.onToolUseStart(currentToolId, currentToolName);
+                            } else if ("content_block_stop".equals(eventType)) {
+                                if (currentToolId != null) {
+                                    JsonObject parsedInput;
+                                    try {
+                                        parsedInput = JsonParser.parseString(
+                                                currentToolInput.toString()).getAsJsonObject();
+                                    } catch (Exception e) {
+                                        parsedInput = new JsonObject();
                                     }
+                                    callbacks.onToolUseComplete(
+                                            currentToolId, currentToolName, parsedInput);
+                                    currentToolId = null;
+                                    currentToolName = null;
+                                    currentToolInput.setLength(0);
                                 }
-                                case "content_block_delta" -> {
-                                    JsonObject delta = json.getAsJsonObject("delta");
-                                    if (delta != null) {
-                                        String deltaType = delta.get("type").getAsString();
-                                        if ("text_delta".equals(deltaType)) {
-                                            callbacks.onTextDelta(
-                                                    delta.get("text").getAsString());
-                                        } else if ("input_json_delta".equals(deltaType)) {
-                                            String partial = delta.get("partial_json")
-                                                    .getAsString();
-                                            currentToolInput.append(partial);
-                                            if (currentToolId != null) {
-                                                callbacks.onToolUseDelta(currentToolId, partial);
-                                            }
-                                        }
-                                    }
-                                }
-                                case "content_block_stop" -> {
-                                    if (currentToolId != null) {
-                                        JsonObject parsedInput;
-                                        try {
-                                            parsedInput = JsonParser.parseString(
-                                                    currentToolInput.toString()).getAsJsonObject();
-                                        } catch (Exception e) {
-                                            parsedInput = new JsonObject();
-                                        }
-                                        callbacks.onToolUseComplete(
-                                                currentToolId, currentToolName, parsedInput);
-                                        currentToolId = null;
-                                        currentToolName = null;
-                                        currentToolInput.setLength(0);
-                                    }
-                                }
-                                case "message_delta" -> {
-                                    JsonObject delta = json.getAsJsonObject("delta");
-                                    String stopReason = delta != null && delta.has("stop_reason")
-                                            ? delta.get("stop_reason").getAsString() : "end_turn";
-                                    JsonObject usage = json.getAsJsonObject("usage");
-                                    int outTokens = usage != null && usage.has("output_tokens")
-                                            ? usage.get("output_tokens").getAsInt() : 0;
-                                    callbacks.onComplete(stopReason, inputTokens, outTokens);
-                                }
-                                case "message_stop" -> {
-                                    // Stream complete
-                                }
-                                case "error" -> {
-                                    JsonObject error = json.getAsJsonObject("error");
-                                    String msg = error != null && error.has("message")
-                                            ? error.get("message").getAsString()
-                                            : "Unknown API error";
-                                    callbacks.onError(msg);
-                                }
+                            } else if ("message_delta".equals(eventType)) {
+                                JsonObject delta = json.getAsJsonObject("delta");
+                                String stopReason = delta != null && delta.has("stop_reason")
+                                        ? delta.get("stop_reason").getAsString() : "end_turn";
+                                JsonObject usage = json.getAsJsonObject("usage");
+                                int outTokens = usage != null && usage.has("output_tokens")
+                                        ? usage.get("output_tokens").getAsInt() : 0;
+                                callbacks.onComplete(stopReason, inputTokens, outTokens);
+                            } else if ("message_stop".equals(eventType)) {
+                                // Stream complete
+                            } else if ("error".equals(eventType)) {
+                                JsonObject error = json.getAsJsonObject("error");
+                                String msg = error != null && error.has("message")
+                                        ? error.get("message").getAsString()
+                                        : "Unknown API error";
+                                callbacks.onError(msg);
                             }
                         } catch (Exception e) {
                             ClaudeCraft.LOGGER.debug("Skipping non-JSON SSE data: {}",

@@ -2,17 +2,17 @@ plugins {
     id 'eclipse'
     id 'idea'
     id 'maven-publish'
-    id 'net.minecraftforge.gradle' version '6.0.+'
+    id 'net.minecraftforge.gradle' version '5.1.+'
 }
 
 version = '1.0.0'
 group = 'com.claudecraft'
 archivesBaseName = 'claudecraft'
 
-java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+java.toolchain.languageVersion = JavaLanguageVersion.of(8)
 
 minecraft {
-    mappings channel: 'official', version: '1.20.1'
+    mappings channel: 'official', version: '1.16.5'
 
     runs {
         client {
@@ -43,22 +43,21 @@ repositories {
     maven {
         url "https://maven.squiddev.cc"
         content {
-            includeGroup("cc.tweaked")
+            includeGroup("org.squiddev")
         }
     }
     mavenCentral()
 }
 
 dependencies {
-    minecraft 'net.minecraftforge:forge:1.20.1-47.2.0'
+    minecraft 'net.minecraftforge:forge:1.16.5-36.2.39'
 
     // CC: Tweaked API
-    compileOnly "cc.tweaked:cc-tweaked-1.20.1-forge-api:1.117.1"
-    compileOnly "cc.tweaked:cc-tweaked-1.20.1-core-api:1.117.1"
-    runtimeOnly "cc.tweaked:cc-tweaked-1.20.1-forge:1.117.1"
+    compileOnly "org.squiddev:cc-tweaked-1.16.5-api:1.101.2"
+    runtimeOnly "org.squiddev:cc-tweaked-1.16.5:1.101.2"
 
     // Gson for JSON (bundled with Minecraft, declared for compile)
-    compileOnly "com.google.code.gson:gson:2.10.1"
+    compileOnly "com.google.code.gson:gson:2.8.6"
 }
 
 jar {

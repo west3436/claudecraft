@@ -13,7 +13,7 @@ public class ClaudeCraftConfig {
     public static final ForgeConfigSpec.ConfigValue<String> SYSTEM_PROMPT_PREFIX;
 
     static {
-        var builder = new ForgeConfigSpec.Builder();
+        ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
 
         builder.comment("ClaudeCraft Configuration").push("api");
 

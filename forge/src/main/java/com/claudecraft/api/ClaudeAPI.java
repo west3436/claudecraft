@@ -5,7 +5,6 @@ import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
 import dan200.computercraft.api.peripheral.IComputerAccess;
-import org.jetbrains.annotations.NotNull;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -32,9 +31,9 @@ public class ClaudeAPI implements ILuaAPI {
     private static final AtomicLong REQUEST_COUNTER = new AtomicLong(0);
 
     /** JSON keys that should be arrays when their Lua table is empty. */
-    private static final Set<String> ARRAY_KEYS = Set.of(
+    private static final Set<String> ARRAY_KEYS = new HashSet<>(Arrays.asList(
             "required", "content", "messages", "tools", "stop_sequences", "args", "items"
-    );
+    ));
 
     private final IComputerAccess computer;
     private final Map<String, ClaudeApiClient.StreamHandle> activeRequests = new ConcurrentHashMap<>();
@@ -88,7 +87,7 @@ public class ClaudeAPI implements ILuaAPI {
      * @return Request ID string
      */
     @LuaFunction
-    public final String sendMessage(@NotNull IArguments args) throws LuaException {
+    public final String sendMessage(IArguments args) throws LuaException {
         if (!ClaudeCraftConfig.isConfigured()) {
             throw new LuaException("API key not configured. Use /claudecraft setkey <key>");
         }
@@ -174,7 +173,7 @@ public class ClaudeAPI implements ILuaAPI {
      * Cancel an in-flight request.
      */
     @LuaFunction
-    public final void cancelRequest(@NotNull IArguments args) throws LuaException {
+    public final void cancelRequest(IArguments args) throws LuaException {
         String requestId = args.getString(0);
         ClaudeApiClient.StreamHandle handle = activeRequests.remove(requestId);
         if (handle != null) {
@@ -214,17 +213,18 @@ public class ClaudeAPI implements ILuaAPI {
     private JsonElement luaValueToJson(Object value, String parentKey) {
         if (value == null) {
             return JsonNull.INSTANCE;
-        } else if (value instanceof String s) {
-            return new JsonPrimitive(s);
-        } else if (value instanceof Number n) {
-            double d = n.doubleValue();
+        } else if (value instanceof String) {
+            return new JsonPrimitive((String) value);
+        } else if (value instanceof Number) {
+            double d = ((Number) value).doubleValue();
             if (d == Math.floor(d) && !Double.isInfinite(d)) {
                 return new JsonPrimitive((long) d);
             }
             return new JsonPrimitive(d);
-        } else if (value instanceof Boolean b) {
-            return new JsonPrimitive(b);
-        } else if (value instanceof Map<?, ?> map) {
+        } else if (value instanceof Boolean) {
+            return new JsonPrimitive((Boolean) value);
+        } else if (value instanceof Map) {
+            Map<?, ?> map = (Map<?, ?>) value;
             // Empty table: decide based on context
             if (map.isEmpty()) {
                 if (parentKey != null && ARRAY_KEYS.contains(parentKey)) {
@@ -237,7 +237,8 @@ public class ClaudeAPI implements ILuaAPI {
             boolean isArray = true;
             int maxIndex = 0;
             for (Object key : map.keySet()) {
-                if (key instanceof Number n) {
+                if (key instanceof Number) {
+                    Number n = (Number) key;
                     int idx = n.intValue();
                     if (idx == n.doubleValue() && idx >= 1) {
                         maxIndex = Math.max(maxIndex, idx);
@@ -261,8 +262,8 @@ public class ClaudeAPI implements ILuaAPI {
             JsonObject obj = new JsonObject();
             for (Map.Entry<?, ?> entry : ((Map<Object, Object>) map).entrySet()) {
                 String key = String.valueOf(entry.getKey());
-                if (entry.getKey() instanceof Number n) {
-                    double d = n.doubleValue();
+                if (entry.getKey() instanceof Number) {
+                    double d = ((Number) entry.getKey()).doubleValue();
                     if (d == Math.floor(d)) key = String.valueOf((long) d);
                 }
                 obj.add(key, luaValueToJson(entry.getValue(), key));
