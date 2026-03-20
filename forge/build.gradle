@@ -43,7 +43,7 @@ repositories {
     maven {
         url "https://maven.squiddev.cc"
         content {
-            includeGroup("cc.tweaked")
+            includeGroup("org.squiddev")
         }
     }
     mavenCentral()
@@ -52,10 +52,9 @@ repositories {
 dependencies {
     minecraft 'net.minecraftforge:forge:1.19.2-43.3.0'
 
-    // CC: Tweaked API
-    compileOnly "cc.tweaked:cc-tweaked-1.19.2-forge-api:1.101.3"
-    compileOnly "cc.tweaked:cc-tweaked-1.19.2-core-api:1.101.3"
-    runtimeOnly "cc.tweaked:cc-tweaked-1.19.2-forge:1.101.3"
+    // CC: Tweaked API (old org.squiddev artifact naming for 1.19.2)
+    compileOnly fg.deobf("org.squiddev:cc-tweaked-1.19.2:1.101.3:api")
+    runtimeOnly fg.deobf("org.squiddev:cc-tweaked-1.19.2:1.101.3")
 
     // Gson for JSON (bundled with Minecraft, declared for compile)
     compileOnly "com.google.code.gson:gson:2.10.1"
