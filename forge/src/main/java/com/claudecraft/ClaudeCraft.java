@@ -4,7 +4,6 @@ import com.claudecraft.api.ClaudeAPI;
 import com.claudecraft.config.ClaudeCraftConfig;
 import dan200.computercraft.api.ComputerCraftAPI;
 import net.minecraftforge.common.MinecraftForge;
-import net.minecraftforge.fml.ModLoadingContext;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.config.ModConfig;
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent;
@@ -17,11 +16,11 @@ public class ClaudeCraft {
     public static final String MOD_ID = "claudecraft";
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
-    public ClaudeCraft() {
-        var modBus = FMLJavaModLoadingContext.get().getModEventBus();
+    public ClaudeCraft(FMLJavaModLoadingContext context) {
+        var modBus = context.getModEventBus();
 
         // Register config
-        ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, ClaudeCraftConfig.SPEC);
+        context.registerConfig(ModConfig.Type.SERVER, ClaudeCraftConfig.SPEC);
 
         // Common setup
         modBus.addListener(this::commonSetup);
