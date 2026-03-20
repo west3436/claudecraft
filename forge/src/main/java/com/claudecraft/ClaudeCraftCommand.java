@@ -3,9 +3,9 @@ package com.claudecraft;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.StringArgumentType;
-import net.minecraft.commands.CommandSourceStack;
-import net.minecraft.commands.Commands;
-import net.minecraft.network.chat.TextComponent;
+import net.minecraft.command.CommandSource;
+import net.minecraft.command.Commands;
+import net.minecraft.util.text.StringTextComponent;
 import net.minecraftforge.event.RegisterCommandsEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
@@ -15,7 +15,7 @@ public class ClaudeCraftCommand {
 
     @SubscribeEvent
     public static void onRegisterCommands(RegisterCommandsEvent event) {
-        CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
+        CommandDispatcher<CommandSource> dispatcher = event.getDispatcher();
 
         dispatcher.register(Commands.literal("claudecraft")
                 .requires(source -> source.hasPermission(3)) // OP level 3+
@@ -25,13 +25,13 @@ public class ClaudeCraftCommand {
                                     String key = StringArgumentType.getString(ctx, "key");
                                     if (!key.startsWith("sk-")) {
                                         ctx.getSource().sendFailure(
-                                                new TextComponent("Invalid API key. Must start with sk-"));
+                                                new StringTextComponent("Invalid API key. Must start with sk-"));
                                         return 0;
                                     }
                                     ClaudeCraftConfig.API_KEY.set(key);
                                     ClaudeCraftConfig.API_KEY.save();
                                     ctx.getSource().sendSuccess(
-                                            new TextComponent("API key set successfully. ClaudeCraft is ready."),
+                                            new StringTextComponent("API key set successfully. ClaudeCraft is ready."),
                                             false);
                                     ClaudeCraft.LOGGER.info("ClaudeCraft API key updated by {}",
                                             ctx.getSource().getDisplayName().getString());
@@ -44,7 +44,7 @@ public class ClaudeCraftCommand {
                                     ClaudeCraftConfig.MODEL.set(model);
                                     ClaudeCraftConfig.MODEL.save();
                                     ctx.getSource().sendSuccess(
-                                            new TextComponent("Model set to: " + model), false);
+                                            new StringTextComponent("Model set to: " + model), false);
                                     return 1;
                                 })))
                 .then(Commands.literal("status")
@@ -53,7 +53,7 @@ public class ClaudeCraftCommand {
                             String model = ClaudeCraftConfig.MODEL.get();
                             int maxTokens = ClaudeCraftConfig.MAX_TOKENS.get();
                             ctx.getSource().sendSuccess(
-                                    new TextComponent(String.format(
+                                    new StringTextComponent(String.format(
                                             "ClaudeCraft Status:\n  API Key: %s\n  Model: %s\n  Max Tokens: %d",
                                             configured ? "configured" : "NOT SET",
                                             model, maxTokens)),
