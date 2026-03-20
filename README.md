@@ -6,8 +6,8 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 
 ## Requirements
 
-- Minecraft 1.20.1
-- Minecraft Forge 47.2.0+
+- Minecraft 1.21.1
+- Minecraft Forge 52.1.0+
 - [CC: Tweaked](https://modrinth.com/mod/cc-tweaked) 1.117.1+
 - An [Anthropic API key](https://console.anthropic.com/)
 
