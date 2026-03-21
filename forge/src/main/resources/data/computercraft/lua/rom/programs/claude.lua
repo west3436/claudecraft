@@ -205,6 +205,7 @@ function tools.getDefs()
         {name="get_info", description="System info: ID, fuel, peripherals.", input_schema={type="object",properties={}}},
         {name="redstone", description="Redstone I/O.", input_schema={type="object",properties={action={type="string"},side={type="string"},value={type="number"}},required={"action","side"}}},
         {name="peripheral_call", description="Call peripheral method.", input_schema={type="object",properties={side={type="string"},method={type="string"},args={type="array",description="Arguments to pass"}},required={"side","method"}}},
+        {name="get_recipes", description="Get Minecraft crafting/smelting/smithing recipes from the server. Returns all recipes, optionally filtered by output item name or recipe type.", input_schema={type="object",properties={item={type="string",description="Filter by output item (e.g. 'iron_pickaxe', 'diamond')"},type={type="string",description="Filter by recipe type (e.g. 'crafting', 'smelting', 'smithing')"}}}},
     }
     if claude.isWebAccessEnabled() and http then
         d[#d+1] = {name="http_request", description="Make an HTTP request. Returns response body (max 64KB).", input_schema={type="object",properties={url={type="string",description="The URL to request"},method={type="string",description="HTTP method (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS). Default: GET"},body={type="string",description="Request body (for POST/PUT/PATCH)"},headers={type="object",description="Request headers as key-value pairs"}},required={"url"}}}
@@ -368,6 +369,11 @@ function tools._exec(name, input)
         else local fn=turtle[a]; if fn then local ok,err=fn(input.count); return {success=ok,error=err} end
             return {error="Unknown: "..a}
         end
+    elseif name == "get_recipes" then
+        local result = claude.getRecipes(input.item, input.type)
+        local ok2, parsed = pcall(textutils.unserialiseJSON, result)
+        if ok2 and parsed then return parsed end
+        return {error="Failed to parse recipes"}
     elseif name == "http_request" then
         if not claude.isWebAccessEnabled() then return {error="Web access is disabled in server config"} end
         if not http then return {error="HTTP API not available"} end
@@ -423,7 +429,7 @@ local model = claude.getModel()
 local sysPr = string.format(
     "You are Claude Code, an AI assistant inside a ComputerCraft computer in Minecraft. " ..
     "ID: %d. Label: %s. Terminal: %dx%d. %s" ..
-    "You have tools for files, search, shell, %s%sredstone, peripherals.\n" ..
+    "You have tools for files, search, shell, %s%sredstone, peripherals, and Minecraft recipes.\n" ..
     "Be VERY concise (tiny terminal). Use tools proactively. Write idiomatic CC:Tweaked Lua.\n" ..
     "NEVER use emojis - the terminal cannot display them (they show as ?). " ..
     "NEVER use markdown formatting (no **, no ##, no ```) - this is a plain text terminal, not a markdown renderer. " ..

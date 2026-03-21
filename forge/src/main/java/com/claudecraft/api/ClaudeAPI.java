@@ -6,6 +6,12 @@ import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
 import dan200.computercraft.api.peripheral.IComputerAccess;
 
+import net.minecraft.util.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.item.ItemStack;
+import net.minecraft.item.crafting.*;
+import net.minecraftforge.fml.server.ServerLifecycleHooks;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -187,6 +193,71 @@ public class ClaudeAPI implements ILuaAPI {
         if (handle != null) {
             handle.cancel();
         }
+    }
+
+    /**
+     * Query all in-game recipes from the server's RecipeManager.
+     * Returns a JSON string with recipe data, optionally filtered.
+     *
+     * @param args Lua arguments: itemFilter (string|nil), typeFilter (string|nil)
+     * @return JSON string with recipes array and count
+     */
+    @LuaFunction
+    public final String getRecipes(IArguments args) throws LuaException {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            throw new LuaException("Server not available");
+        }
+
+        String itemFilter = args.optString(0).orElse(null);
+        String typeFilter = args.optString(1).orElse(null);
+
+        RecipeManager recipeManager = server.getRecipeManager();
+
+        JsonArray results = new JsonArray();
+
+        for (IRecipe<?> recipe : recipeManager.getRecipes()) {
+            String typeStr = recipe.getType().toString();
+
+            if (typeFilter != null && !typeStr.contains(typeFilter)) continue;
+
+            ItemStack result = recipe.getResultItem();
+            ResourceLocation resultId = result.getItem().getRegistryName();
+            String resultName = resultId != null ? resultId.toString() : "unknown";
+
+            if (itemFilter != null && !resultName.contains(itemFilter)) continue;
+
+            JsonObject recipeObj = new JsonObject();
+            recipeObj.addProperty("id", recipe.getId().toString());
+            recipeObj.addProperty("type", typeStr);
+            recipeObj.addProperty("result", resultName);
+            recipeObj.addProperty("result_count", result.getCount());
+
+            JsonArray ingredients = new JsonArray();
+            for (Ingredient ingredient : recipe.getIngredients()) {
+                if (ingredient.isEmpty()) continue;
+                JsonArray items = new JsonArray();
+                for (ItemStack item : ingredient.getItems()) {
+                    ResourceLocation itemId = item.getItem().getRegistryName();
+                    if (itemId != null) items.add(itemId.toString());
+                }
+                if (items.size() > 0) ingredients.add(items);
+            }
+            recipeObj.add("ingredients", ingredients);
+
+            if (recipe instanceof ShapedRecipe) {
+                ShapedRecipe shaped = (ShapedRecipe) recipe;
+                recipeObj.addProperty("width", shaped.getWidth());
+                recipeObj.addProperty("height", shaped.getHeight());
+            }
+
+            results.add(recipeObj);
+        }
+
+        JsonObject response = new JsonObject();
+        response.add("recipes", results);
+        response.addProperty("count", results.size());
+        return GSON.toJson(response);
     }
 
     // -- Internal helpers --
