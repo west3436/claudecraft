@@ -1,6 +1,7 @@
 package com.claudecraft.api;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.channel.ChannelProcessManager;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
@@ -21,17 +22,26 @@ import java.util.concurrent.atomic.AtomicLong;
  * Built-in Lua API available on all CC:Tweaked computers as 'claude'.
  *
  * Lua API:
- *   claude.isConfigured()                         -> boolean
+ *   claude.isApiKeyConfigured()                   -> boolean
  *   claude.getModel()                             -> string
+ *   claude.startChannel(isTurtle, label, w, h)    -> success, errorOrPort
+ *   claude.stopChannel()                          -> nil
+ *   claude.isChannelReady()                       -> boolean
  *   claude.sendMessage(messages, tools, system)   -> requestId (string)
+ *   claude.sendToolResult(reqId, callId, result)  -> nil
  *   claude.cancelRequest(requestId)               -> nil
  *
  * Events pushed to the computer:
+ *   -- API key mode (streaming):
  *   "claude_delta"      requestId, text
  *   "claude_tool_start" requestId, toolId, toolName
  *   "claude_tool_done"  requestId, toolId, toolName, inputJson
  *   "claude_done"       requestId, stopReason, inputTokens, outputTokens
  *   "claude_error"      requestId, errorMessage
+ *
+ *   -- Channel mode:
+ *   "claude_tool_exec"  requestId, callId, toolName, inputJson
+ *   "claude_text"       requestId, text
  */
 public class ClaudeAPI implements ILuaAPI {
     private static final Gson GSON = new GsonBuilder().create();
@@ -43,7 +53,10 @@ public class ClaudeAPI implements ILuaAPI {
     );
 
     private final IComputerAccess computer;
-    private final Map<String, ClaudeApiClient.StreamHandle> activeRequests = new ConcurrentHashMap<>();
+    private final Map<String, ClaudeBackend.StreamHandle> activeRequests = new ConcurrentHashMap<>();
+
+    /** Per-computer channel backend, created when startChannel() is called. */
+    private volatile ChannelBackend channelBackend;
 
     public ClaudeAPI(IComputerAccess computer) {
         this.computer = computer;
@@ -61,24 +74,32 @@ public class ClaudeAPI implements ILuaAPI {
 
     @Override
     public void shutdown() {
-        for (ClaudeApiClient.StreamHandle handle : activeRequests.values()) {
+        for (ClaudeBackend.StreamHandle handle : activeRequests.values()) {
             handle.cancel();
         }
         activeRequests.clear();
+
+        // Stop channel process if running
+        if (channelBackend != null) {
+            channelBackend.shutdown();
+            ChannelProcessManager.getInstance().stopSession(computer.getID());
+            channelBackend = null;
+        }
     }
 
     // -- Lua API Methods --
 
     /**
-     * Check if the API key is configured.
+     * Check if the API key is configured (for API key mode).
      */
     @LuaFunction
-    public final boolean isConfigured() {
-        return ClaudeCraftConfig.isConfigured();
+    public final boolean isApiKeyConfigured() {
+        String key = ClaudeCraftConfig.API_KEY.get();
+        return key != null && !key.isEmpty() && key.startsWith("sk-");
     }
 
     /**
-     * Get the configured model name.
+     * Get the configured model name (API key mode).
      */
     @LuaFunction
     public final String getModel() {
@@ -94,16 +115,70 @@ public class ClaudeAPI implements ILuaAPI {
     }
 
     /**
-     * Send a message to Claude with streaming. Returns immediately with a request ID.
-     * The response is delivered via events: claude_delta, claude_tool_start,
-     * claude_tool_done, claude_done, claude_error.
+     * Start a Claude Code channel session for this computer.
+     * Spawns a channel server and Claude Code process automatically.
+     *
+     * @param args Lua arguments: isTurtle (boolean), label (string), termW (int), termH (int)
+     * @return {success: boolean, portOrError: number|string}
+     */
+    @LuaFunction
+    public final Object[] startChannel(@NotNull IArguments args) throws LuaException {
+        boolean isTurtle = args.optBoolean(0).orElse(false);
+        String label = args.optString(1).orElse("Computer");
+        int termW = args.optInt(2).orElse(51);
+        int termH = args.optInt(3).orElse(19);
+
+        int computerId = computer.getID();
+
+        try {
+            ChannelProcessManager.SessionInfo session =
+                    ChannelProcessManager.getInstance().startSession(
+                            computerId, isTurtle, label, termW, termH);
+
+            channelBackend = new ChannelBackend(session.port);
+
+            ClaudeCraft.LOGGER.info("Channel spawned for computer #{} on port {}",
+                    computerId, session.port);
+            return new Object[]{true, session.port};
+
+        } catch (Exception e) {
+            ClaudeCraft.LOGGER.error("Failed to start channel for computer #{}", computerId, e);
+            return new Object[]{false, e.getMessage()};
+        }
+    }
+
+    /**
+     * Stop the channel session for this computer.
+     */
+    @LuaFunction
+    public final void stopChannel() {
+        if (channelBackend != null) {
+            channelBackend.shutdown();
+            channelBackend = null;
+        }
+        ChannelProcessManager.getInstance().stopSession(computer.getID());
+    }
+
+    /**
+     * Check if a channel session is active and connected.
+     */
+    @LuaFunction
+    public final boolean isChannelReady() {
+        return channelBackend != null && channelBackend.isConfigured();
+    }
+
+    /**
+     * Send a message to Claude. Returns immediately with a request ID.
+     * Automatically routes to the active backend (API key or channel).
      *
      * @param args Lua arguments: messages (table), tools (table|nil), system (string|nil)
      * @return Request ID string
      */
     @LuaFunction
     public final String sendMessage(@NotNull IArguments args) throws LuaException {
-        if (!ClaudeCraftConfig.isConfigured()) {
+        boolean useChannel = channelBackend != null;
+
+        if (!useChannel && !isApiKeyConfigured()) {
             throw new LuaException("API key not configured. Use /claudecraft setkey <key>");
         }
 
@@ -131,8 +206,8 @@ public class ClaudeAPI implements ILuaAPI {
         JsonArray messagesJson = luaMapToJsonArray(messagesTable);
         request.add("messages", messagesJson);
 
-        // Convert tools Lua table to JSON array if provided
-        if (toolsOpt.isPresent()) {
+        // Convert tools Lua table to JSON array if provided (API key mode only)
+        if (toolsOpt.isPresent() && !useChannel) {
             JsonArray toolsJson = luaMapToJsonArray(toolsOpt.get());
             request.add("tools", toolsJson);
         }
@@ -140,48 +215,35 @@ public class ClaudeAPI implements ILuaAPI {
         // Generate request ID
         String requestId = "req_" + REQUEST_COUNTER.incrementAndGet();
 
-        // Start the streaming request
-        ClaudeApiClient client = ClaudeApiClient.getInstance();
-        ClaudeApiClient.StreamHandle handle = client.streamRequest(
-                request.toString(),
-                new ClaudeApiClient.StreamCallbacks() {
-                    @Override
-                    public void onTextDelta(String text) {
-                        queueEvent("claude_delta", requestId, text);
-                    }
-
-                    @Override
-                    public void onToolUseStart(String id, String name) {
-                        queueEvent("claude_tool_start", requestId, id, name);
-                    }
-
-                    @Override
-                    public void onToolUseDelta(String id, String partialJson) {
-                        // Accumulate only — don't send partial tool input to Lua
-                    }
-
-                    @Override
-                    public void onToolUseComplete(String id, String name, JsonObject input) {
-                        String inputJson = GSON.toJson(input);
-                        queueEvent("claude_tool_done", requestId, id, name, inputJson);
-                    }
-
-                    @Override
-                    public void onComplete(String stopReason, int inputTokens, int outputTokens) {
-                        queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens);
-                        activeRequests.remove(requestId);
-                    }
-
-                    @Override
-                    public void onError(String message) {
-                        queueEvent("claude_error", requestId, message);
-                        activeRequests.remove(requestId);
-                    }
-                }
-        );
+        // Route to active backend
+        ClaudeBackend.StreamHandle handle;
+        if (useChannel) {
+            handle = channelBackend.sendMessage(request.toString(),
+                    createChannelCallbacks(requestId));
+        } else {
+            handle = ApiKeyBackend.getInstance().sendMessage(request.toString(),
+                    createApiKeyCallbacks(requestId));
+        }
 
         activeRequests.put(requestId, handle);
         return requestId;
+    }
+
+    /**
+     * Send a tool execution result back to the channel server.
+     * Channel mode only.
+     */
+    @LuaFunction
+    public final void sendToolResult(@NotNull IArguments args) throws LuaException {
+        if (channelBackend == null) {
+            throw new LuaException("sendToolResult is only available in channel mode");
+        }
+
+        String requestId = args.getString(0);
+        String callId = args.getString(1);
+        String resultJson = args.getString(2);
+
+        channelBackend.sendToolResult(callId, resultJson);
     }
 
     /**
@@ -190,7 +252,7 @@ public class ClaudeAPI implements ILuaAPI {
     @LuaFunction
     public final void cancelRequest(@NotNull IArguments args) throws LuaException {
         String requestId = args.getString(0);
-        ClaudeApiClient.StreamHandle handle = activeRequests.remove(requestId);
+        ClaudeBackend.StreamHandle handle = activeRequests.remove(requestId);
         if (handle != null) {
             handle.cancel();
         }
@@ -261,6 +323,81 @@ public class ClaudeAPI implements ILuaAPI {
         return GSON.toJson(response);
     }
 
+    // -- Callback factories --
+
+    private ClaudeBackend.StreamCallbacks createApiKeyCallbacks(String requestId) {
+        return new ClaudeBackend.StreamCallbacks() {
+            @Override
+            public void onTextDelta(String text) {
+                queueEvent("claude_delta", requestId, text);
+            }
+
+            @Override
+            public void onToolUseStart(String id, String name) {
+                queueEvent("claude_tool_start", requestId, id, name);
+            }
+
+            @Override
+            public void onToolUseDelta(String id, String partialJson) {}
+
+            @Override
+            public void onToolUseComplete(String id, String name, JsonObject input) {
+                String inputJson = GSON.toJson(input);
+                queueEvent("claude_tool_done", requestId, id, name, inputJson);
+            }
+
+            @Override
+            public void onComplete(String stopReason, int inputTokens, int outputTokens) {
+                queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens);
+                activeRequests.remove(requestId);
+            }
+
+            @Override
+            public void onError(String message) {
+                queueEvent("claude_error", requestId, message);
+                activeRequests.remove(requestId);
+            }
+        };
+    }
+
+    private ClaudeBackend.StreamCallbacks createChannelCallbacks(String requestId) {
+        return new ClaudeBackend.StreamCallbacks() {
+            @Override
+            public void onTextDelta(String text) {}
+
+            @Override
+            public void onToolUseStart(String id, String name) {}
+
+            @Override
+            public void onToolUseDelta(String id, String partialJson) {}
+
+            @Override
+            public void onToolUseComplete(String id, String name, JsonObject input) {}
+
+            @Override
+            public void onToolExecRequest(String callId, String toolName, String inputJson) {
+                queueEvent("claude_tool_exec", requestId, callId, toolName, inputJson);
+            }
+
+            @Override
+            public void onReply(String text) {
+                queueEvent("claude_text", requestId, text);
+            }
+
+            @Override
+            public void onComplete(String stopReason, int inputTokens, int outputTokens) {
+                queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens);
+                activeRequests.remove(requestId);
+            }
+
+            @Override
+            public void onError(String message) {
+                queueEvent("claude_error", requestId, message);
+                activeRequests.remove(requestId);
+            }
+        };
+    }
+
     // -- Internal helpers --
 
     private void queueEvent(String name, Object... args) {
@@ -271,10 +408,6 @@ public class ClaudeAPI implements ILuaAPI {
         }
     }
 
-    /**
-     * Convert a Lua table (Map from CC: Tweaked) to a Gson JsonArray.
-     * Assumes sequential numeric keys starting at 1.0 (Lua convention).
-     */
     private JsonArray luaMapToJsonArray(Map<?, ?> table) {
         JsonArray array = new JsonArray();
         for (int i = 1; ; i++) {
@@ -285,10 +418,6 @@ public class ClaudeAPI implements ILuaAPI {
         return array;
     }
 
-    /**
-     * Convert a Lua value to a JsonElement.
-     * @param parentKey the JSON key this value belongs to (for context-aware conversion), or null
-     */
     @SuppressWarnings("unchecked")
     private JsonElement luaValueToJson(Object value, String parentKey) {
         if (value == null) {
@@ -304,7 +433,6 @@ public class ClaudeAPI implements ILuaAPI {
         } else if (value instanceof Boolean b) {
             return new JsonPrimitive(b);
         } else if (value instanceof Map<?, ?> map) {
-            // Empty table: decide based on context
             if (map.isEmpty()) {
                 if (parentKey != null && ARRAY_KEYS.contains(parentKey)) {
                     return new JsonArray();
@@ -312,7 +440,6 @@ public class ClaudeAPI implements ILuaAPI {
                 return new JsonObject();
             }
 
-            // Check if it's an array-like table (all keys are sequential ints from 1)
             boolean isArray = true;
             int maxIndex = 0;
             for (Object key : map.keySet()) {
@@ -336,7 +463,6 @@ public class ClaudeAPI implements ILuaAPI {
                 return arr;
             }
 
-            // It's an object
             JsonObject obj = new JsonObject();
             for (Map.Entry<?, ?> entry : ((Map<Object, Object>) map).entrySet()) {
                 String key = String.valueOf(entry.getKey());
