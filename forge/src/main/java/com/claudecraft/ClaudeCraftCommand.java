@@ -34,7 +34,7 @@ public class ClaudeCraftCommand {
                                             new TextComponent("API key set successfully. ClaudeCraft is ready."),
                                             false);
                                     ClaudeCraft.LOGGER.info("ClaudeCraft API key updated by {}",
-                                            ctx.getSource().getTextName());
+                                            ctx.getSource().getDisplayName().getString());
                                     return 1;
                                 })))
                 .then(Commands.literal("model")
@@ -49,15 +49,20 @@ public class ClaudeCraftCommand {
                                 })))
                 .then(Commands.literal("status")
                         .executes(ctx -> {
-                            boolean configured = ClaudeCraftConfig.isConfigured();
+                            boolean apiKeySet = ClaudeCraftConfig.isApiKeyConfigured();
                             String model = ClaudeCraftConfig.MODEL.get();
                             int maxTokens = ClaudeCraftConfig.MAX_TOKENS.get();
+
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("ClaudeCraft Status:\n");
+                            sb.append("  API Key: ").append(
+                                    apiKeySet ? "configured" : "NOT SET").append("\n");
+                            sb.append("  Model: ").append(model).append("\n");
+                            sb.append("  Max Tokens: ").append(maxTokens);
+
+                            String status = sb.toString();
                             ctx.getSource().sendSuccess(
-                                    new TextComponent(String.format(
-                                            "ClaudeCraft Status:\n  API Key: %s\n  Model: %s\n  Max Tokens: %d",
-                                            configured ? "configured" : "NOT SET",
-                                            model, maxTokens)),
-                                    false);
+                                    new TextComponent(status), false);
                             return 1;
                         })));
     }

@@ -18,19 +18,19 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Handles HTTP communication with the Claude API using SSE streaming.
+ * Direct Anthropic API backend using SSE streaming.
  * Uses Java 17's built-in HttpClient — no external dependencies.
- * Thread-safe. Shared across all AI Modem peripherals.
+ * Thread-safe. Shared across all computers.
  */
-public class ClaudeApiClient {
+public class ApiKeyBackend implements ClaudeBackend {
     private static final String API_URL = "https://api.anthropic.com/v1/messages";
     private static final String API_VERSION = "2023-06-01";
-    private static ClaudeApiClient INSTANCE;
+    private static ApiKeyBackend INSTANCE;
     private final HttpClient httpClient;
     private final ExecutorService executor;
     private final AtomicInteger activeRequests = new AtomicInteger(0);
 
-    private ClaudeApiClient() {
+    private ApiKeyBackend() {
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r, "ClaudeCraft-API");
             t.setDaemon(true);
@@ -42,49 +42,15 @@ public class ClaudeApiClient {
                 .build();
     }
 
-    public static synchronized ClaudeApiClient getInstance() {
+    public static synchronized ApiKeyBackend getInstance() {
         if (INSTANCE == null) {
-            INSTANCE = new ClaudeApiClient();
+            INSTANCE = new ApiKeyBackend();
         }
         return INSTANCE;
     }
 
-    /**
-     * Represents a streaming request that can be cancelled.
-     */
-    public static class StreamHandle {
-        private volatile Thread requestThread;
-        private volatile boolean cancelled = false;
-
-        public void cancel() {
-            cancelled = true;
-            Thread t = requestThread;
-            if (t != null) {
-                t.interrupt();
-            }
-        }
-
-        public boolean isCancelled() {
-            return cancelled;
-        }
-    }
-
-    /**
-     * Callbacks for streaming events.
-     */
-    public interface StreamCallbacks {
-        void onTextDelta(String text);
-        void onToolUseStart(String id, String name);
-        void onToolUseDelta(String id, String partialJson);
-        void onToolUseComplete(String id, String name, JsonObject input);
-        void onComplete(String stopReason, int inputTokens, int outputTokens);
-        void onError(String message);
-    }
-
-    /**
-     * Start a streaming request to Claude. Runs asynchronously.
-     */
-    public StreamHandle streamRequest(String requestJson, StreamCallbacks callbacks) {
+    @Override
+    public StreamHandle sendMessage(String requestJson, StreamCallbacks callbacks) {
         StreamHandle handle = new StreamHandle();
 
         int maxConcurrent = ClaudeCraftConfig.MAX_CONCURRENT_REQUESTS.get();
@@ -99,7 +65,6 @@ public class ClaudeApiClient {
             return handle;
         }
 
-        // Inject stream:true into the request
         JsonObject body;
         try {
             body = JsonParser.parseString(requestJson).getAsJsonObject();
@@ -123,9 +88,8 @@ public class ClaudeApiClient {
         activeRequests.incrementAndGet();
 
         executor.submit(() -> {
-            handle.requestThread = Thread.currentThread();
+            handle.setRequestThread(Thread.currentThread());
             try {
-                // Send request and get streaming response
                 HttpResponse<java.io.InputStream> response = httpClient.send(
                         request, HttpResponse.BodyHandlers.ofInputStream());
 
@@ -147,7 +111,6 @@ public class ClaudeApiClient {
                     return;
                 }
 
-                // Parse SSE stream line-by-line
                 parseSSEStream(response.body(), handle, callbacks);
 
             } catch (InterruptedException e) {
@@ -160,20 +123,26 @@ public class ClaudeApiClient {
                 }
             } finally {
                 activeRequests.decrementAndGet();
-                handle.requestThread = null;
+                handle.setRequestThread(null);
             }
         });
 
         return handle;
     }
 
-    /**
-     * Parse an SSE stream from the Claude API.
-     * SSE format: lines of "event: <type>\ndata: <json>\n\n"
-     */
+    @Override
+    public boolean isConfigured() {
+        String key = ClaudeCraftConfig.API_KEY.get();
+        return key != null && !key.isEmpty() && key.startsWith("sk-");
+    }
+
+    @Override
+    public void shutdown() {
+        executor.shutdownNow();
+    }
+
     private void parseSSEStream(java.io.InputStream inputStream, StreamHandle handle,
                                  StreamCallbacks callbacks) throws Exception {
-        // Track current tool_use block being streamed
         String currentToolId = null;
         String currentToolName = null;
         StringBuilder currentToolInput = new StringBuilder();
@@ -194,7 +163,6 @@ public class ClaudeApiClient {
                 } else if (line.startsWith("data: ")) {
                     dataBuilder.append(line.substring(6));
                 } else if (line.isEmpty()) {
-                    // End of event — process it
                     if (eventType != null && dataBuilder.length() > 0) {
                         String data = dataBuilder.toString().trim();
 
@@ -284,9 +252,5 @@ public class ClaudeApiClient {
                 }
             }
         }
-    }
-
-    public void shutdown() {
-        executor.shutdownNow();
     }
 }
