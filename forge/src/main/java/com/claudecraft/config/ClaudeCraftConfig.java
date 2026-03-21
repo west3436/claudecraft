@@ -11,6 +11,7 @@ public class ClaudeCraftConfig {
     public static final ForgeConfigSpec.IntValue MAX_CONCURRENT_REQUESTS;
     public static final ForgeConfigSpec.IntValue REQUEST_TIMEOUT_SECONDS;
     public static final ForgeConfigSpec.ConfigValue<String> SYSTEM_PROMPT_PREFIX;
+    public static final ForgeConfigSpec.BooleanValue ENABLE_WEB_ACCESS;
 
     static {
         var builder = new ForgeConfigSpec.Builder();
@@ -40,6 +41,10 @@ public class ClaudeCraftConfig {
         SYSTEM_PROMPT_PREFIX = builder
                 .comment("Text prepended to the system prompt for all requests.")
                 .define("systemPromptPrefix", "");
+
+        ENABLE_WEB_ACCESS = builder
+                .comment("Allow Claude to make HTTP requests using ComputerCraft's http API. Disabled by default for security.")
+                .define("enableWebAccess", false);
 
         builder.pop();
         SPEC = builder.build();
