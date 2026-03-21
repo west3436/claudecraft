@@ -10,6 +10,7 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.*;
+import net.minecraft.core.Registry;
 import net.minecraftforge.registries.ForgeRegistries;
 import net.minecraftforge.server.ServerLifecycleHooks;
 import org.jetbrains.annotations.NotNull;
@@ -280,7 +281,7 @@ public class ClaudeAPI implements ILuaAPI {
         JsonArray results = new JsonArray();
 
         for (Recipe<?> recipe : recipeManager.getRecipes()) {
-            ResourceLocation typeId = ForgeRegistries.RECIPE_TYPES.getKey(recipe.getType());
+            ResourceLocation typeId = Registry.RECIPE_TYPE.getKey(recipe.getType());
             String typeStr = typeId != null ? typeId.toString() : "unknown";
 
             if (typeFilter != null && !typeStr.contains(typeFilter)) continue;
