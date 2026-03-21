@@ -23,15 +23,15 @@ public class ClaudeCraftConfig {
                 .define("apiKey", "");
 
         MODEL = builder
-                .comment("Claude model to use for requests.")
+                .comment("Claude model to use for requests (API key mode only).")
                 .define("model", "claude-sonnet-4-6");
 
         MAX_TOKENS = builder
-                .comment("Maximum tokens in Claude's response.")
+                .comment("Maximum tokens in Claude's response (API key mode only).")
                 .defineInRange("maxTokens", 4096, 256, 16384);
 
         MAX_CONCURRENT_REQUESTS = builder
-                .comment("Maximum concurrent API requests across all computers.")
+                .comment("Maximum concurrent API requests across all computers (API key mode only).")
                 .defineInRange("maxConcurrentRequests", 3, 1, 10);
 
         REQUEST_TIMEOUT_SECONDS = builder
@@ -50,7 +50,7 @@ public class ClaudeCraftConfig {
         SPEC = builder.build();
     }
 
-    public static boolean isConfigured() {
+    public static boolean isApiKeyConfigured() {
         String key = API_KEY.get();
         return key != null && !key.isEmpty() && key.startsWith("sk-");
     }
