@@ -1,0 +1,13 @@
+{
+  "name": "claudecraft-channel",
+  "version": "0.1.0",
+  "description": "Claude Code Channel server for ClaudeCraft — bridges CC:Tweaked computers to Claude Code sessions",
+  "type": "module",
+  "scripts": {
+    "start": "bun run claudecraft-channel.ts",
+    "launch": "bun run launch.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1"
+  }
+}
