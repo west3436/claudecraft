@@ -79,6 +79,14 @@ public class ClaudeAPI implements ILuaAPI {
     }
 
     /**
+     * Check if web access is enabled in the config.
+     */
+    @LuaFunction
+    public final boolean isWebAccessEnabled() {
+        return ClaudeCraftConfig.ENABLE_WEB_ACCESS.get();
+    }
+
+    /**
      * Send a message to Claude with streaming. Returns immediately with a request ID.
      * The response is delivered via events: claude_delta, claude_tool_start,
      * claude_tool_done, claude_done, claude_error.
