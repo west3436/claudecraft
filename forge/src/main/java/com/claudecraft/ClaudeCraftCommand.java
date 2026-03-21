@@ -49,13 +49,13 @@ public class ClaudeCraftCommand {
                                 })))
                 .then(Commands.literal("status")
                         .executes(ctx -> {
-                            boolean configured = ClaudeCraftConfig.isConfigured();
+                            boolean apiKeySet = ClaudeCraftConfig.isApiKeyConfigured();
                             String model = ClaudeCraftConfig.MODEL.get();
                             int maxTokens = ClaudeCraftConfig.MAX_TOKENS.get();
                             ctx.getSource().sendSuccess(
                                     new StringTextComponent(String.format(
-                                            "ClaudeCraft Status:\n  API Key: %s\n  Model: %s\n  Max Tokens: %d",
-                                            configured ? "configured" : "NOT SET",
+                                            "ClaudeCraft Status:\n  API Key: %s\n  Model: %s\n  Max Tokens: %d\n  Channel mode: available (per-computer)",
+                                            apiKeySet ? "configured" : "NOT SET",
                                             model, maxTokens)),
                                     false);
                             return 1;

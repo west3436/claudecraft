@@ -369,11 +369,6 @@ function tools._exec(name, input)
         else local fn=turtle[a]; if fn then local ok,err=fn(input.count); return {success=ok,error=err} end
             return {error="Unknown: "..a}
         end
-    elseif name == "get_recipes" then
-        local result = claude.getRecipes(input.item, input.type)
-        local ok2, parsed = pcall(textutils.unserialiseJSON, result)
-        if ok2 and parsed then return parsed end
-        return {error="Failed to parse recipes"}
     elseif name == "http_request" then
         if not claude.isWebAccessEnabled() then return {error="Web access is disabled in server config"} end
         if not http then return {error="HTTP API not available"} end
@@ -405,8 +400,81 @@ function tools._exec(name, input)
         response.close()
         if body and #body > 65536 then body = body:sub(1, 65536) .. "\n...(truncated at 64KB)" end
         return {status=code, headers=respHeaders, body=body}
+    elseif name == "get_recipes" then
+        local json = claude.getRecipes(input.item, input.type)
+        local ok2, data = pcall(textutils.unserialiseJSON, json)
+        if ok2 and data then return data end
+        return {error="Failed to parse recipe data"}
     else
         return {error="Unknown tool: "..name}
+    end
+end
+
+----------------------------------------------------------------------
+-- MODE SELECTION & SETUP
+----------------------------------------------------------------------
+
+local MODE_FILE = "/.claude/mode"
+
+local function readMode()
+    if not fs.exists(MODE_FILE) then return nil end
+    local f = fs.open(MODE_FILE, "r"); if not f then return nil end
+    local m = f.readAll(); f.close()
+    m = m and m:match("^%s*(%S+)") or nil
+    if m == "apikey" or m == "channel" then return m end
+    return nil
+end
+
+local function saveMode(m)
+    ensureDir()
+    local f = fs.open(MODE_FILE, "w"); if f then f.write(m); f.close() end
+end
+
+local function showSetupScreen()
+    term.clear()
+    term.setBackgroundColour(colors.black)
+
+    -- Header
+    term.setCursorPos(1,1)
+    term.setBackgroundColour(colors.blue); term.setTextColour(colors.white)
+    term.clearLine()
+    local title = "Claude Code Setup"
+    term.setCursorPos(math.max(1,math.floor((sW-#title)/2)+1),1)
+    term.write(title)
+    term.setBackgroundColour(colors.black)
+
+    local y = 3
+    local function ln(text, col)
+        term.setCursorPos(1,y); term.setTextColour(col or colors.white)
+        term.write(text); y = y + 1
+    end
+
+    ln("Choose how to connect to Claude:")
+    y = y + 1
+    term.setTextColour(colors.cyan)
+    ln("  1. API Key", colors.cyan)
+    ln("     Server operator provides an", colors.lightGray)
+    ln("     Anthropic API key. Streaming.", colors.lightGray)
+    y = y + 1
+    ln("  2. Claude Code", colors.cyan)
+    ln("     Uses Claude Code on the server.", colors.lightGray)
+    ln("     No API key needed.", colors.lightGray)
+    y = y + 1
+    ln("Type 1 or 2:", colors.yellow)
+
+    term.setCursorPos(14, y-1)
+    term.setTextColour(colors.white)
+    term.setCursorBlink(true)
+
+    while true do
+        local ev, key = os.pullEvent("key")
+        if key == keys.one then
+            term.setCursorBlink(false)
+            return "apikey"
+        elseif key == keys.two then
+            term.setCursorBlink(false)
+            return "channel"
+        end
     end
 end
 
@@ -414,12 +482,75 @@ end
 -- MAIN
 ----------------------------------------------------------------------
 
--- Check the built-in claude API is configured
-if not claude.isConfigured() then
+local backendMode = readMode()
+
+-- First-time setup: show mode selection screen
+if not backendMode then
+    backendMode = showSetupScreen()
+    saveMode(backendMode)
+end
+
+-- Channel mode: auto-start Claude Code session
+if backendMode == "channel" then
+    term.clear(); term.setCursorPos(1,1)
+    term.setTextColour(colors.cyan)
+    print("Starting Claude Code session...")
+    print("This may take a moment...")
+
+    local ok, portOrErr = claude.startChannel(
+        turtle ~= nil,
+        os.getComputerLabel() or "Computer",
+        sW, sH
+    )
+
+    if not ok then
+        term.setTextColour(colors.red)
+        print("")
+        print("Failed to start channel:")
+        print(tostring(portOrErr))
+        print("")
+        term.setTextColour(colors.yellow)
+        print("Type 'claude' to try again, or")
+        print("delete /.claude/mode to reconfigure.")
+        return
+    end
+
+    -- Poll for channel server readiness (os.sleep yields properly in CC)
+    term.setTextColour(colors.lightGray)
+    print("Waiting for channel server...")
+    local ready = false
+    for i = 1, 60 do
+        if claude.isChannelReady() then
+            ready = true
+            break
+        end
+        os.sleep(0.5)
+    end
+
+    if not ready then
+        term.setTextColour(colors.red)
+        print("Channel server did not start.")
+        print("")
+        term.setTextColour(colors.yellow)
+        print("Type 'claude' to try again.")
+        claude.stopChannel()
+        return
+    end
+
+    term.setTextColour(colors.lime)
+    print("Connected on port "..tostring(portOrErr))
+    os.sleep(0.5)
+end
+
+-- API key mode: check configuration
+if backendMode == "apikey" and not claude.isApiKeyConfigured() then
     term.clear(); term.setCursorPos(1,1)
     printError("API key not set.")
     printError("An operator must run:")
     printError("  /claudecraft setkey <key>")
+    printError("")
+    print("Or delete /.claude/mode to switch")
+    print("to Claude Code channel mode.")
     return
 end
 
@@ -484,9 +615,19 @@ local function showToolResult(name, result)
 end
 
 local function main()
-    ui.init("Claude Code // "..model)
+    local title
+    if backendMode == "channel" then
+        title = "Claude Code // Channel"
+    else
+        title = "Claude Code // "..model
+    end
+    ui.init(title)
     ui.add("Claude Code for ComputerCraft", C.info)
-    ui.add("Streaming via ClaudeCraft API", C.sep)
+    if backendMode == "channel" then
+        ui.add("Connected via Claude Code Channel", C.sep)
+    else
+        ui.add("Streaming via ClaudeCraft API", C.sep)
+    end
     if monitor then ui.add("Monitor: "..monSide.." ("..monW.."x"..monH..")", C.info) end
     ui.add("Type /help for commands.", C.sep)
     ui.blank(); ui.drawBody()
@@ -500,64 +641,67 @@ local function main()
         if #inp == 0 then goto continue end
 
         if inp == "/clear" then msgs={}; hist.clear(); ui.clear(); ui.add("Cleared.", C.info); ui.drawBody(); goto continue end
+        if inp == "/mode" then
+            fs.delete(MODE_FILE)
+            ui.add("Mode reset. Run 'claude' again.", C.info); ui.drawBody()
+            break
+        end
         if inp == "/help" then
             ui.add("Commands:", C.info)
             ui.add("  /clear - Reset conversation", C.ai)
+            ui.add("  /mode  - Change connection mode", C.ai)
             ui.add("  /help  - This help", C.ai)
             ui.add("  exit   - Quit", C.ai)
             ui.add("Scroll: mouse wheel / PgUp/PgDn", C.ai)
+            ui.blank()
+            ui.add("Setup & FAQ:", C.info)
+            ui.add("github.com/west3436/claudecraft", C.sep)
+            ui.add("  /docs/channel-mode.md", C.sep)
             ui.blank(); ui.drawBody(); goto continue
         end
 
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
         msgs[#msgs+1] = {role="user", content=inp}
 
-        local round = 0
-        while round < 15 do
-            round = round + 1
-
-            -- Show thinking
+        if backendMode == "channel" then
+            ----------------------------------------------------------------
+            -- CHANNEL MODE: Claude Code manages the agentic loop.
+            -- We send the message, then react to tool_exec and reply events.
+            ----------------------------------------------------------------
             term.setCursorPos(1,sH); term.setTextColour(C.info); term.setBackgroundColour(C.bg)
-            term.clearLine(); term.write("  Streaming...")
+            term.clearLine(); term.write("  Thinking...")
 
-            -- Send via peripheral (streaming)
-            local reqId = claude.sendMessage(msgs, toolDefs, sysPr)
-
+            local reqId = claude.sendMessage(msgs, nil, sysPr)
             local responseText = ""
-            local toolCalls = {}
             local done = false
 
-            -- Collect streaming events
             while not done do
                 local ev, p1, p2, p3, p4 = os.pullEvent()
 
-                if ev == "claude_delta" and p1 == reqId then
-                    responseText = responseText .. p2
-                    -- Live-render: clear thinking and show text accumulating
+                if ev == "claude_tool_exec" and p1 == reqId then
+                    -- Channel wants us to execute a Minecraft tool
+                    -- p2=callId, p3=toolName, p4=inputJson
                     term.setCursorPos(1,sH); term.clearLine()
-
-                elseif ev == "claude_tool_start" and p1 == reqId then
-                    -- p2=toolId, p3=toolName
-                    -- Will be completed by claude_tool_done
-
-                elseif ev == "claude_tool_done" and p1 == reqId then
-                    -- p2=toolId, p3=toolName, p4=inputJson
                     local input = {}
                     if p4 then
                         local ok2, parsed = pcall(textutils.unserialiseJSON, p4)
                         if ok2 and parsed then input = parsed end
                     end
-                    toolCalls[#toolCalls+1] = {id=p2, name=p3, input=input}
+                    showToolCall(p3, input)
+                    local r = tools.exec(p3, input)
+                    showToolResult(p3, r)
+                    claude.sendToolResult(reqId, p2, textutils.serialiseJSON(r))
+
+                elseif ev == "claude_text" and p1 == reqId then
+                    -- Full reply text from Claude Code
+                    responseText = responseText .. p2
+                    term.setCursorPos(1,sH); term.clearLine()
 
                 elseif ev == "claude_done" and p1 == reqId then
                     done = true
                     term.setCursorPos(1,sH); term.clearLine()
-                    -- p2=stopReason, p3=inputTokens, p4=outputTokens
-                    if responseText and #responseText > 0 then
+                    if #responseText > 0 then
                         ui.add(responseText, C.ai); ui.blank()
-                    end
-                    if p3 and p4 and (p3 > 0 or p4 > 0) then
-                        ui.add(string.format("(%s in / %s out)", tostring(p3), tostring(p4)), C.sep)
                     end
                     ui.drawBody()
 
@@ -576,35 +720,112 @@ local function main()
                 end
             end
 
-            if #toolCalls > 0 then
-                -- Build assistant message with content blocks
-                local blocks = {}
-                if #responseText > 0 then blocks[#blocks+1] = {type="text", text=responseText} end
-                for _, tc in ipairs(toolCalls) do
-                    blocks[#blocks+1] = {type="tool_use", id=tc.id, name=tc.name, input=tc.input}
-                end
-                msgs[#msgs+1] = {role="assistant", content=blocks}
+            if #responseText > 0 then
+                msgs[#msgs+1] = {role="assistant", content=responseText}
+            end
+        else
+            ----------------------------------------------------------------
+            -- API KEY MODE: Lua-side agentic loop with streaming.
+            ----------------------------------------------------------------
+            local round = 0
+            while round < 15 do
+                round = round + 1
 
-                -- Execute tools locally
-                local results = {}
-                for _, tc in ipairs(toolCalls) do
-                    showToolCall(tc.name, tc.input)
-                    local r = tools.exec(tc.name, tc.input)
-                    showToolResult(tc.name, r)
-                    results[#results+1] = {type="tool_result", tool_use_id=tc.id, content=textutils.serialiseJSON(r)}
+                -- Show thinking
+                term.setCursorPos(1,sH); term.setTextColour(C.info); term.setBackgroundColour(C.bg)
+                term.clearLine(); term.write("  Streaming...")
+
+                -- Send via peripheral (streaming)
+                local reqId = claude.sendMessage(msgs, toolDefs, sysPr)
+
+                local responseText = ""
+                local toolCalls = {}
+                local done = false
+
+                -- Collect streaming events
+                while not done do
+                    local ev, p1, p2, p3, p4 = os.pullEvent()
+
+                    if ev == "claude_delta" and p1 == reqId then
+                        responseText = responseText .. p2
+                        -- Live-render: clear thinking and show text accumulating
+                        term.setCursorPos(1,sH); term.clearLine()
+
+                    elseif ev == "claude_tool_start" and p1 == reqId then
+                        -- p2=toolId, p3=toolName
+                        -- Will be completed by claude_tool_done
+
+                    elseif ev == "claude_tool_done" and p1 == reqId then
+                        -- p2=toolId, p3=toolName, p4=inputJson
+                        local input = {}
+                        if p4 then
+                            local ok2, parsed = pcall(textutils.unserialiseJSON, p4)
+                            if ok2 and parsed then input = parsed end
+                        end
+                        toolCalls[#toolCalls+1] = {id=p2, name=p3, input=input}
+
+                    elseif ev == "claude_done" and p1 == reqId then
+                        done = true
+                        term.setCursorPos(1,sH); term.clearLine()
+                        -- p2=stopReason, p3=inputTokens, p4=outputTokens
+                        if responseText and #responseText > 0 then
+                            ui.add(responseText, C.ai); ui.blank()
+                        end
+                        if p3 and p4 and (p3 > 0 or p4 > 0) then
+                            ui.add(string.format("(%s in / %s out)", tostring(p3), tostring(p4)), C.sep)
+                        end
+                        ui.drawBody()
+
+                    elseif ev == "claude_error" and p1 == reqId then
+                        done = true
+                        term.setCursorPos(1,sH); term.clearLine()
+                        ui.add("Error: "..(p2 or "unknown"), C.err); ui.blank(); ui.drawBody()
+                        table.remove(msgs) -- remove failed user message
+                        break
+
+                    elseif ev == "key" and p1 == keys.q then
+                        claude.cancelRequest(reqId)
+                        done = true
+                        term.setCursorPos(1,sH); term.clearLine()
+                        ui.add("(cancelled)", C.sep); ui.drawBody()
+                    end
                 end
-                msgs[#msgs+1] = {role="user", content=results}
-                -- Continue loop for Claude to process results
-            else
-                if #responseText > 0 then
-                    msgs[#msgs+1] = {role="assistant", content=responseText}
+
+                if #toolCalls > 0 then
+                    -- Build assistant message with content blocks
+                    local blocks = {}
+                    if #responseText > 0 then blocks[#blocks+1] = {type="text", text=responseText} end
+                    for _, tc in ipairs(toolCalls) do
+                        blocks[#blocks+1] = {type="tool_use", id=tc.id, name=tc.name, input=tc.input}
+                    end
+                    msgs[#msgs+1] = {role="assistant", content=blocks}
+
+                    -- Execute tools locally
+                    local results = {}
+                    for _, tc in ipairs(toolCalls) do
+                        showToolCall(tc.name, tc.input)
+                        local r = tools.exec(tc.name, tc.input)
+                        showToolResult(tc.name, r)
+                        results[#results+1] = {type="tool_result", tool_use_id=tc.id, content=textutils.serialiseJSON(r)}
+                    end
+                    msgs[#msgs+1] = {role="user", content=results}
+                    -- Continue loop for Claude to process results
+                else
+                    if #responseText > 0 then
+                        msgs[#msgs+1] = {role="assistant", content=responseText}
+                    end
+                    break
                 end
-                break
             end
         end
 
         hist.save(msgs)
         ::continue::
+    end
+
+    -- Clean up channel session on exit
+    if backendMode == "channel" then
+        claude.stopChannel()
     end
 
     term.setBackgroundColour(colors.black); term.setTextColour(colors.white)
