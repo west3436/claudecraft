@@ -206,6 +206,9 @@ function tools.getDefs()
         {name="redstone", description="Redstone I/O.", input_schema={type="object",properties={action={type="string"},side={type="string"},value={type="number"}},required={"action","side"}}},
         {name="peripheral_call", description="Call peripheral method.", input_schema={type="object",properties={side={type="string"},method={type="string"},args={type="array",description="Arguments to pass"}},required={"side","method"}}},
     }
+    if claude.isWebAccessEnabled() and http then
+        d[#d+1] = {name="http_request", description="Make an HTTP request. Returns response body (max 64KB).", input_schema={type="object",properties={url={type="string",description="The URL to request"},method={type="string",description="HTTP method (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS). Default: GET"},body={type="string",description="Request body (for POST/PUT/PATCH)"},headers={type="object",description="Request headers as key-value pairs"}},required={"url"}}}
+    end
     if turtle then
         d[#d+1] = {name="turtle_move", description="Move: forward/back/up/down/turnLeft/turnRight.", input_schema={type="object",properties={action={type="string"},count={type="number"}},required={"action"}}}
         d[#d+1] = {name="turtle_dig", description="Dig: dig/digUp/digDown.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
@@ -365,6 +368,38 @@ function tools._exec(name, input)
         else local fn=turtle[a]; if fn then local ok,err=fn(input.count); return {success=ok,error=err} end
             return {error="Unknown: "..a}
         end
+    elseif name == "http_request" then
+        if not claude.isWebAccessEnabled() then return {error="Web access is disabled in server config"} end
+        if not http then return {error="HTTP API not available"} end
+        local method = (input.method or "GET"):upper()
+        local url = input.url
+        if not url:match("^https?://") then return {error="URL must start with http:// or https://"} end
+        local headers = input.headers or {}
+        local response, err
+        if method == "GET" then
+            response, err = http.get(url, headers)
+        elseif method == "POST" then
+            response, err = http.post(url, input.body or "", headers)
+        else
+            response, err = http.request({url=url, method=method, body=input.body, headers=headers})
+            if response == true then
+                -- http.request returns true and fires http_success/http_failure events
+                local timer = os.startTimer(30)
+                while true do
+                    local ev, p1, p2 = os.pullEvent()
+                    if ev == "http_success" and p1 == url then response = p2; break
+                    elseif ev == "http_failure" and p1 == url then return {error="HTTP request failed: "..(p2 or "unknown error")}
+                    elseif ev == "timer" and p1 == timer then return {error="HTTP request timed out"} end
+                end
+            end
+        end
+        if not response then return {error="HTTP request failed: "..(err or "unknown error")} end
+        local code = response.getResponseCode()
+        local respHeaders = response.getResponseHeaders()
+        local body = response.readAll()
+        response.close()
+        if body and #body > 65536 then body = body:sub(1, 65536) .. "\n...(truncated at 64KB)" end
+        return {status=code, headers=respHeaders, body=body}
     else
         return {error="Unknown tool: "..name}
     end
@@ -389,13 +424,14 @@ local model = claude.getModel()
 local sysPr = string.format(
     "You are Claude Code, an AI assistant inside a ComputerCraft computer in Minecraft. " ..
     "ID: %d. Label: %s. Terminal: %dx%d. %s" ..
-    "You have tools for files, search, shell, %sredstone, peripherals.\n" ..
+    "You have tools for files, search, shell, %s%sredstone, peripherals.\n" ..
     "Be VERY concise (tiny terminal). Use tools proactively. Write idiomatic CC:Tweaked Lua.\n" ..
     "NEVER use emojis - the terminal cannot display them (they show as ?). " ..
     "NEVER use markdown formatting (no **, no ##, no ```) - this is a plain text terminal, not a markdown renderer. " ..
     "Use plain text only.",
     os.getComputerID(), os.getComputerLabel() or "unlabeled", sW, sH,
     turtle and string.format("TURTLE. Fuel: %s/%s. ", tostring(turtle.getFuelLevel()), tostring(turtle.getFuelLimit())) or "",
+    (claude.isWebAccessEnabled() and http) and "HTTP requests, " or "",
     turtle and "turtle control, " or "")
 
 local toolDefs = tools.getDefs()
