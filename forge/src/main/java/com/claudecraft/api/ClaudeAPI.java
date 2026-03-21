@@ -7,6 +7,14 @@ import dan200.computercraft.api.lua.*;
 import dan200.computercraft.api.peripheral.IComputerAccess;
 import org.jetbrains.annotations.NotNull;
 
+import net.minecraft.resources.ResourceLocation;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.*;
+import net.minecraft.core.RegistryAccess;
+import net.minecraftforge.registries.ForgeRegistries;
+import net.minecraftforge.server.ServerLifecycleHooks;
+
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -188,6 +196,72 @@ public class ClaudeAPI implements ILuaAPI {
         if (handle != null) {
             handle.cancel();
         }
+    }
+
+    /**
+     * Query all in-game recipes from the server's RecipeManager.
+     * Returns a JSON string with recipe data, optionally filtered.
+     *
+     * @param args Lua arguments: itemFilter (string|nil), typeFilter (string|nil)
+     * @return JSON string with recipes array and count
+     */
+    @LuaFunction
+    public final String getRecipes(@NotNull IArguments args) throws LuaException {
+        MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
+        if (server == null) {
+            throw new LuaException("Server not available");
+        }
+
+        String itemFilter = args.optString(0).orElse(null);
+        String typeFilter = args.optString(1).orElse(null);
+
+        RecipeManager recipeManager = server.getRecipeManager();
+        RegistryAccess registryAccess = server.registryAccess();
+
+        JsonArray results = new JsonArray();
+
+        for (Recipe<?> recipe : recipeManager.getRecipes()) {
+            ResourceLocation typeId = ForgeRegistries.RECIPE_TYPES.getKey(recipe.getType());
+            String typeStr = typeId != null ? typeId.toString() : "unknown";
+
+            if (typeFilter != null && !typeStr.contains(typeFilter)) continue;
+
+            ItemStack result = recipe.getResultItem(registryAccess);
+            ResourceLocation resultId = ForgeRegistries.ITEMS.getKey(result.getItem());
+            String resultName = resultId != null ? resultId.toString() : "unknown";
+
+            if (itemFilter != null && !resultName.contains(itemFilter)) continue;
+
+            JsonObject recipeObj = new JsonObject();
+            recipeObj.addProperty("id", recipe.getId().toString());
+            recipeObj.addProperty("type", typeStr);
+            recipeObj.addProperty("result", resultName);
+            recipeObj.addProperty("result_count", result.getCount());
+
+            JsonArray ingredients = new JsonArray();
+            for (Ingredient ingredient : recipe.getIngredients()) {
+                if (ingredient.isEmpty()) continue;
+                JsonArray items = new JsonArray();
+                for (ItemStack item : ingredient.getItems()) {
+                    ResourceLocation itemId = ForgeRegistries.ITEMS.getKey(item.getItem());
+                    if (itemId != null) items.add(itemId.toString());
+                }
+                if (items.size() > 0) ingredients.add(items);
+            }
+            recipeObj.add("ingredients", ingredients);
+
+            if (recipe instanceof ShapedRecipe shaped) {
+                recipeObj.addProperty("width", shaped.getWidth());
+                recipeObj.addProperty("height", shaped.getHeight());
+            }
+
+            results.add(recipeObj);
+        }
+
+        JsonObject response = new JsonObject();
+        response.add("recipes", results);
+        response.addProperty("count", results.size());
+        return GSON.toJson(response);
     }
 
     // -- Internal helpers --
