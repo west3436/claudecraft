@@ -18,7 +18,7 @@ public class ClaudeCraftCommand {
         CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
 
         dispatcher.register(Commands.literal("claudecraft")
-                .requires(source -> source.hasPermission(3)) // OP level 3+
+                .requires(source -> source.hasPermission(3))
                 .then(Commands.literal("setkey")
                         .then(Commands.argument("key", StringArgumentType.string())
                                 .executes(ctx -> {
@@ -49,15 +49,20 @@ public class ClaudeCraftCommand {
                                 })))
                 .then(Commands.literal("status")
                         .executes(ctx -> {
-                            boolean configured = ClaudeCraftConfig.isConfigured();
+                            boolean apiKeySet = ClaudeCraftConfig.isApiKeyConfigured();
                             String model = ClaudeCraftConfig.MODEL.get();
                             int maxTokens = ClaudeCraftConfig.MAX_TOKENS.get();
+
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("ClaudeCraft Status:\n");
+                            sb.append("  API Key: ").append(
+                                    apiKeySet ? "configured" : "NOT SET").append("\n");
+                            sb.append("  Model: ").append(model).append("\n");
+                            sb.append("  Max Tokens: ").append(maxTokens);
+
+                            String status = sb.toString();
                             ctx.getSource().sendSuccess(
-                                    Component.literal(String.format(
-                                            "ClaudeCraft Status:\n  API Key: %s\n  Model: %s\n  Max Tokens: %d",
-                                            configured ? "configured" : "NOT SET",
-                                            model, maxTokens)),
-                                    false);
+                                    Component.literal(status), false);
                             return 1;
                         })));
     }
