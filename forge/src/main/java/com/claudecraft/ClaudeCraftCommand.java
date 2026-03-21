@@ -18,7 +18,7 @@ public class ClaudeCraftCommand {
         CommandDispatcher<CommandSourceStack> dispatcher = event.getDispatcher();
 
         dispatcher.register(Commands.literal("claudecraft")
-                .requires(source -> source.hasPermission(3)) // OP level 3+
+                .requires(source -> source.hasPermission(3))
                 .then(Commands.literal("setkey")
                         .then(Commands.argument("key", StringArgumentType.string())
                                 .executes(ctx -> {
