@@ -3,6 +3,8 @@ package com.claudecraft.channel;
 import com.claudecraft.ClaudeCraft;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -42,22 +44,26 @@ public class ChannelProcessManager {
             this.port = port;
             this.process = process;
         }
-
-        public boolean isAlive() {
-            return true;
-        }
     }
 
     /**
      * Start a channel session for a computer. Returns the session info.
-     * If a session is already running for this computer, returns the existing one.
+     * If a session is already running for this computer and healthy, returns it.
+     * If the existing session is dead, removes it and starts a fresh one.
      */
     public SessionInfo startSession(int computerId, boolean isTurtle, String label,
                                      int termWidth, int termHeight) throws Exception {
-        // Return existing session if port is known
+        // Bug 3 fix: Health-check existing session before returning it.
         SessionInfo existing = sessions.get(computerId);
         if (existing != null) {
-            return existing;
+            if (isPortReachable(existing.port)) {
+                return existing;
+            }
+            // Session is dead — remove and start fresh
+            ClaudeCraft.LOGGER.info(
+                    "Channel session for computer #{} on port {} is unreachable, restarting",
+                    computerId, existing.port);
+            sessions.remove(computerId);
         }
 
         // Ensure channel resources are set up
@@ -83,31 +89,12 @@ public class ChannelProcessManager {
         // Write .mcp.json
         writeMcpJson(sandboxDir, port, computerId, isTurtle, label, termWidth, termHeight);
 
-        // Write .claude/settings.local.json to auto-approve all ClaudeCraft MCP tools
+        // Refactor R1: Generate permissions from ToolDefinitions instead of hardcoding
         Path claudeSettingsDir = sandboxDir.resolve(".claude");
         Files.createDirectories(claudeSettingsDir);
         String settingsJson = "{\n"
                 + "  \"permissions\": {\n"
-                + "    \"allow\": [\n"
-                + "      \"mcp__claudecraft__reply\",\n"
-                + "      \"mcp__claudecraft__read_file\",\n"
-                + "      \"mcp__claudecraft__write_file\",\n"
-                + "      \"mcp__claudecraft__edit_file\",\n"
-                + "      \"mcp__claudecraft__list_files\",\n"
-                + "      \"mcp__claudecraft__find_files\",\n"
-                + "      \"mcp__claudecraft__search_content\",\n"
-                + "      \"mcp__claudecraft__run_command\",\n"
-                + "      \"mcp__claudecraft__delete_path\",\n"
-                + "      \"mcp__claudecraft__move_path\",\n"
-                + "      \"mcp__claudecraft__get_info\",\n"
-                + "      \"mcp__claudecraft__redstone\",\n"
-                + "      \"mcp__claudecraft__peripheral_call\",\n"
-                + "      \"mcp__claudecraft__turtle_move\",\n"
-                + "      \"mcp__claudecraft__turtle_dig\",\n"
-                + "      \"mcp__claudecraft__turtle_place\",\n"
-                + "      \"mcp__claudecraft__turtle_inspect\",\n"
-                + "      \"mcp__claudecraft__turtle_inventory\"\n"
-                + "    ],\n"
+                + "    \"allow\": " + ToolDefinitions.permissionsJsonArray() + ",\n"
                 + "    \"deny\": []\n"
                 + "  }\n"
                 + "}\n";
@@ -207,6 +194,18 @@ public class ChannelProcessManager {
         }
     }
 
+    /**
+     * Bug 3 fix: Quick TCP check to see if a port is accepting connections.
+     */
+    private boolean isPortReachable(int port) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", port), 1000);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void writeCLAUDEmd(Path dir, int computerId, boolean isTurtle, String label,
                                 int termWidth, int termHeight) throws IOException {
         String turtleTools = isTurtle
@@ -250,12 +249,16 @@ public class ChannelProcessManager {
         Path channelScript = ChannelResourceManager.getInstance()
                 .getChannelDir().resolve("claudecraft-channel.ts");
 
+        // Bug 13 fix: Properly escape both backslashes and quotes in label and path
+        String escapedPath = channelScript.toString().replace("\\", "/");
+        String escapedLabel = label.replace("\\", "\\\\").replace("\"", "\\\"");
+
         StringBuilder args = new StringBuilder();
         args.append("[\n");
-        args.append("      \"").append(channelScript.toString().replace("\\", "/")).append("\",\n");
+        args.append("      \"").append(escapedPath).append("\",\n");
         args.append("      \"--port\", \"").append(port).append("\",\n");
         args.append("      \"--computer-id\", \"").append(computerId).append("\",\n");
-        args.append("      \"--label\", \"").append(label.replace("\"", "\\\"")).append("\",\n");
+        args.append("      \"--label\", \"").append(escapedLabel).append("\",\n");
         args.append("      \"--term-width\", \"").append(termWidth).append("\",\n");
         args.append("      \"--term-height\", \"").append(termHeight).append("\"");
         if (isTurtle) {
