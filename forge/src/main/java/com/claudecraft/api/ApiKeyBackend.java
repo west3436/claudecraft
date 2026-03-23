@@ -11,6 +11,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -44,14 +45,19 @@ public class ApiKeyBackend implements ClaudeBackend {
     public StreamHandle sendMessage(String requestJson, StreamCallbacks callbacks) {
         StreamHandle handle = new StreamHandle();
 
+        // Bug 1 fix: Atomic increment-then-check prevents race condition where
+        // two threads both pass a get() check before either increments.
         int maxConcurrent = ClaudeCraftConfig.MAX_CONCURRENT_REQUESTS.get();
-        if (activeRequests.get() >= maxConcurrent) {
+        int current = activeRequests.incrementAndGet();
+        if (current > maxConcurrent) {
+            activeRequests.decrementAndGet();
             callbacks.onError("Too many concurrent requests (max " + maxConcurrent + ")");
             return handle;
         }
 
         String apiKey = ClaudeCraftConfig.API_KEY.get();
         if (apiKey == null || apiKey.isEmpty()) {
+            activeRequests.decrementAndGet();
             callbacks.onError("API key not configured. Use /claudecraft setkey <key>");
             return handle;
         }
@@ -61,6 +67,7 @@ public class ApiKeyBackend implements ClaudeBackend {
         try {
             body = JsonParser.parseString(requestJson).getAsJsonObject();
         } catch (Exception e) {
+            activeRequests.decrementAndGet();
             callbacks.onError("Invalid request JSON: " + e.getMessage());
             return handle;
         }
@@ -68,8 +75,6 @@ public class ApiKeyBackend implements ClaudeBackend {
 
         int timeout = ClaudeCraftConfig.REQUEST_TIMEOUT_SECONDS.get();
         String bodyString = body.toString();
-
-        activeRequests.incrementAndGet();
 
         executor.submit(() -> {
             handle.setRequestThread(Thread.currentThread());
@@ -145,6 +150,11 @@ public class ApiKeyBackend implements ClaudeBackend {
     @Override
     public void shutdown() {
         executor.shutdownNow();
+        try {
+            executor.awaitTermination(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**
@@ -161,7 +171,7 @@ public class ApiKeyBackend implements ClaudeBackend {
     }
 
     /**
-     * Parse an SSE stream from the Claude API.
+     * Parse an Anthropic API SSE stream using the shared {@link SSEParser}.
      */
     private void parseSSEStream(InputStream inputStream, StreamHandle handle,
                                  StreamCallbacks callbacks) throws Exception {
@@ -171,102 +181,85 @@ public class ApiKeyBackend implements ClaudeBackend {
         int inputTokens = 0;
         boolean receivedTerminalEvent = false;
 
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
+        try (SSEParser parser = new SSEParser(inputStream)) {
+            SSEParser.SSEEvent event;
+            while ((event = parser.next(handle)) != null) {
+                String eventType = event.eventType;
+                String data = event.data;
 
-            String eventType = null;
-            StringBuilder dataBuilder = new StringBuilder();
+                try {
+                    JsonObject json = JsonParser.parseString(data).getAsJsonObject();
 
-            String line;
-            while ((line = reader.readLine()) != null) {
-                if (handle.isCancelled()) break;
-
-                if (line.startsWith("event: ")) {
-                    eventType = line.substring(7).trim();
-                } else if (line.startsWith("data: ")) {
-                    dataBuilder.append(line.substring(6));
-                } else if (line.isEmpty()) {
-                    // End of event — process it
-                    if (eventType != null && dataBuilder.length() > 0) {
-                        String data = dataBuilder.toString().trim();
-
-                        try {
-                            JsonObject json = JsonParser.parseString(data).getAsJsonObject();
-
-                            if ("message_start".equals(eventType)) {
-                                JsonObject message = json.getAsJsonObject("message");
-                                if (message != null && message.has("usage")) {
-                                    JsonObject usage = message.getAsJsonObject("usage");
-                                    if (usage.has("input_tokens")) {
-                                        inputTokens = usage.get("input_tokens").getAsInt();
-                                    }
-                                }
-                            } else if ("content_block_start".equals(eventType)) {
-                                JsonObject block = json.getAsJsonObject("content_block");
-                                if (block != null && "tool_use".equals(
-                                        block.get("type").getAsString())) {
-                                    currentToolId = block.get("id").getAsString();
-                                    currentToolName = block.get("name").getAsString();
-                                    currentToolInput.setLength(0);
-                                    callbacks.onToolUseStart(currentToolId, currentToolName);
-                                }
-                            } else if ("content_block_delta".equals(eventType)) {
-                                JsonObject delta = json.getAsJsonObject("delta");
-                                if (delta != null) {
-                                    String deltaType = delta.get("type").getAsString();
-                                    if ("text_delta".equals(deltaType)) {
-                                        callbacks.onTextDelta(
-                                                delta.get("text").getAsString());
-                                    } else if ("input_json_delta".equals(deltaType)) {
-                                        String partial = delta.get("partial_json")
-                                                .getAsString();
-                                        currentToolInput.append(partial);
-                                        if (currentToolId != null) {
-                                            callbacks.onToolUseDelta(currentToolId, partial);
-                                        }
-                                    }
-                                }
-                            } else if ("content_block_stop".equals(eventType)) {
-                                if (currentToolId != null) {
-                                    JsonObject parsedInput;
-                                    try {
-                                        parsedInput = JsonParser.parseString(
-                                                currentToolInput.toString()).getAsJsonObject();
-                                    } catch (Exception e) {
-                                        parsedInput = new JsonObject();
-                                    }
-                                    callbacks.onToolUseComplete(
-                                            currentToolId, currentToolName, parsedInput);
-                                    currentToolId = null;
-                                    currentToolName = null;
-                                    currentToolInput.setLength(0);
-                                }
-                            } else if ("message_delta".equals(eventType)) {
-                                receivedTerminalEvent = true;
-                                JsonObject delta = json.getAsJsonObject("delta");
-                                String stopReason = delta != null && delta.has("stop_reason")
-                                        ? delta.get("stop_reason").getAsString() : "end_turn";
-                                JsonObject usage = json.getAsJsonObject("usage");
-                                int outTokens = usage != null && usage.has("output_tokens")
-                                        ? usage.get("output_tokens").getAsInt() : 0;
-                                callbacks.onComplete(stopReason, inputTokens, outTokens);
-                            } else if ("message_stop".equals(eventType)) {
-                                // Stream complete
-                            } else if ("error".equals(eventType)) {
-                                receivedTerminalEvent = true;
-                                JsonObject error = json.getAsJsonObject("error");
-                                String msg = error != null && error.has("message")
-                                        ? error.get("message").getAsString()
-                                        : "Unknown API error";
-                                callbacks.onError(msg);
+                    if ("message_start".equals(eventType)) {
+                        JsonObject message = json.getAsJsonObject("message");
+                        if (message != null && message.has("usage")) {
+                            JsonObject usage = message.getAsJsonObject("usage");
+                            if (usage.has("input_tokens")) {
+                                inputTokens = usage.get("input_tokens").getAsInt();
                             }
-                        } catch (Exception e) {
-                            ClaudeCraft.LOGGER.debug("Skipping non-JSON SSE data: {}",
-                                    data.substring(0, Math.min(data.length(), 100)));
                         }
+                    } else if ("content_block_start".equals(eventType)) {
+                        JsonObject block = json.getAsJsonObject("content_block");
+                        if (block != null && "tool_use".equals(
+                                block.get("type").getAsString())) {
+                            currentToolId = block.get("id").getAsString();
+                            currentToolName = block.get("name").getAsString();
+                            currentToolInput.setLength(0);
+                            callbacks.onToolUseStart(currentToolId, currentToolName);
+                        }
+                    } else if ("content_block_delta".equals(eventType)) {
+                        JsonObject delta = json.getAsJsonObject("delta");
+                        if (delta != null) {
+                            String deltaType = delta.get("type").getAsString();
+                            if ("text_delta".equals(deltaType)) {
+                                callbacks.onTextDelta(
+                                        delta.get("text").getAsString());
+                            } else if ("input_json_delta".equals(deltaType)) {
+                                String partial = delta.get("partial_json")
+                                        .getAsString();
+                                currentToolInput.append(partial);
+                                if (currentToolId != null) {
+                                    callbacks.onToolUseDelta(currentToolId, partial);
+                                }
+                            }
+                        }
+                    } else if ("content_block_stop".equals(eventType)) {
+                        if (currentToolId != null) {
+                            JsonObject parsedInput;
+                            try {
+                                parsedInput = JsonParser.parseString(
+                                        currentToolInput.toString()).getAsJsonObject();
+                            } catch (Exception e) {
+                                parsedInput = new JsonObject();
+                            }
+                            callbacks.onToolUseComplete(
+                                    currentToolId, currentToolName, parsedInput);
+                            currentToolId = null;
+                            currentToolName = null;
+                            currentToolInput.setLength(0);
+                        }
+                    } else if ("message_delta".equals(eventType)) {
+                        receivedTerminalEvent = true;
+                        JsonObject delta = json.getAsJsonObject("delta");
+                        String stopReason = delta != null && delta.has("stop_reason")
+                                ? delta.get("stop_reason").getAsString() : "end_turn";
+                        JsonObject usage = json.getAsJsonObject("usage");
+                        int outTokens = usage != null && usage.has("output_tokens")
+                                ? usage.get("output_tokens").getAsInt() : 0;
+                        callbacks.onComplete(stopReason, inputTokens, outTokens);
+                    } else if ("message_stop".equals(eventType)) {
+                        // Stream complete
+                    } else if ("error".equals(eventType)) {
+                        receivedTerminalEvent = true;
+                        JsonObject error = json.getAsJsonObject("error");
+                        String msg = error != null && error.has("message")
+                                ? error.get("message").getAsString()
+                                : "Unknown API error";
+                        callbacks.onError(msg);
                     }
-                    eventType = null;
-                    dataBuilder.setLength(0);
+                } catch (Exception e) {
+                    ClaudeCraft.LOGGER.debug("Skipping non-JSON SSE data: {}",
+                            data.substring(0, Math.min(data.length(), 100)));
                 }
             }
         }

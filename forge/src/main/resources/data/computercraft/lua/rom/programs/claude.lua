@@ -246,9 +246,10 @@ function tools._exec(name, input)
         while true do local s = c:find(input.old_text, pos, true); if not s then break end; count=count+1; pos=s+1 end
         if count == 0 then return {error="old_text not found"} end
         if count > 1 then return {error="old_text found "..count.."x, must be unique"} end
-        local esc = input.old_text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1")
-        local rep = input.new_text:gsub("%%", "%%%%")
-        local nc = c:gsub(esc, rep, 1)
+        -- Bug 12 fix: Use plain string.find + string.sub instead of gsub to avoid
+        -- pattern magic character issues with %, (, ), etc. in replacement text.
+        local s, e = c:find(input.old_text, 1, true)
+        local nc = c:sub(1, s-1) .. input.new_text .. c:sub(e+1)
         f = fs.open(input.path,"w"); f.write(nc); f.close()
         return {success=true, path=input.path}
     elseif name == "list_files" then
@@ -386,10 +387,13 @@ function tools._exec(name, input)
             if response == true then
                 local timer = os.startTimer(30)
                 while true do
-                    local ev, p1, p2 = os.pullEvent()
+                    -- Bug 11 fix: Capture all event args and re-queue unrelated events
+                    -- so they aren't silently lost (e.g. peripheral, timer, redstone events).
+                    local ev, p1, p2, p3 = os.pullEvent()
                     if ev == "http_success" and p1 == url then response = p2; break
                     elseif ev == "http_failure" and p1 == url then return {error="HTTP request failed: "..(p2 or "unknown error")}
-                    elseif ev == "timer" and p1 == timer then return {error="HTTP request timed out"} end
+                    elseif ev == "timer" and p1 == timer then return {error="HTTP request timed out"}
+                    else os.queueEvent(ev, p1, p2, p3) end
                 end
             end
         end
@@ -587,7 +591,7 @@ local function showToolResult(name, result)
     elseif result.output and #result.output > 0 then
         local lines = wrap(result.output, sW-4)
         for i,l in ipairs(lines) do
-            if i > 10 then ui.add("  ...("..#lines.." lines)", C.ok); break end
+            if i > 10 then ui.add("  ...("..(#lines-10).." more lines)", C.ok); break end
             ui.add("  "..l, C.ok)
         end
     elseif result.success ~= nil then
@@ -596,15 +600,15 @@ local function showToolResult(name, result)
     elseif result.content then
         local lines = wrap(result.content, sW-4)
         for i=1, math.min(#lines, 8) do ui.add("  "..lines[i], C.ok) end
-        if #lines > 8 then ui.add("  ...("..result.lines.." lines)", C.ok) end
+        if #lines > 8 then ui.add("  ...("..(#lines-8).." more lines)", C.ok) end
     elseif result.files then
         for i,f in ipairs(result.files) do
-            if i > 15 then ui.add("  ...("..result.count..")", C.ok); break end
+            if i > 15 then ui.add("  ...("..(result.count-15).." more items)", C.ok); break end
             ui.add("  "..f.name, C.ok)
         end
     elseif result.matches then
         for i,m in ipairs(result.matches) do
-            if i > 10 then ui.add("  ...("..result.count..")", C.ok); break end
+            if i > 10 then ui.add("  ...("..(result.count-10).." more matches)", C.ok); break end
             ui.add("  "..tostring(m), C.ok)
         end
     else
@@ -835,7 +839,7 @@ end
 parallel.waitForAny(main, function()
     while true do
         local ev, p1 = os.pullEvent()
-        if ev == "mouse_scroll" then ui.scroll(p1)
+        if ev == "mouse_scroll" then ui.scroll(-p1)
         elseif ev == "key" then
             if p1 == keys.pageUp then ui.scroll(1)
             elseif p1 == keys.pageDown then ui.scroll(-1) end
