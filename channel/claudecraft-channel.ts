@@ -74,6 +74,9 @@ let toolCallCounter = 0;
 /** Whether we have an active conversation turn in progress. */
 let activeTurnRequestId: string | null = null;
 
+/** Whether the MCP connection to Claude Code is alive. */
+let mcpConnected = true;
+
 // ---------------------------------------------------------------------------
 // SSE helpers
 // ---------------------------------------------------------------------------
@@ -441,7 +444,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // Connect MCP over stdio
 // ---------------------------------------------------------------------------
 
-await mcp.connect(new StdioServerTransport());
+const transport = new StdioServerTransport();
+await mcp.connect(transport);
+
+// Detect MCP disconnection (Claude Code crash or exit)
+mcp.onclose = () => {
+  mcpConnected = false;
+  console.error("[ClaudeCraft Channel] MCP connection closed — Claude Code has disconnected.");
+
+  // Notify any active SSE connections that the session is dead
+  const reqId = activeTurnRequestId;
+  if (reqId) {
+    sendSSE({ type: "error", message: "Claude Code process disconnected." }, reqId);
+    activeTurnRequestId = null;
+  }
+
+  // Resolve all pending tool calls so they don't hang
+  for (const [callId, pending] of pendingToolCalls) {
+    pending.resolve(JSON.stringify({ error: "Claude Code disconnected" }));
+  }
+  pendingToolCalls.clear();
+};
 
 // ---------------------------------------------------------------------------
 // HTTP Server (for the Minecraft mod)
@@ -460,7 +483,8 @@ Bun.serve({
     if (req.method === "GET" && url.pathname === "/health") {
       return new Response(
         JSON.stringify({
-          status: "ok",
+          status: mcpConnected ? "ok" : "degraded",
+          mcpConnected,
           computerId: COMPUTER_ID,
           isTurtle: IS_TURTLE,
         }),
@@ -488,6 +512,16 @@ Bun.serve({
         cancel() {
           if (requestId) {
             sseConnections.delete(requestId);
+            // Bug 8 fix: If the disconnected SSE was the active turn,
+            // clean up so pending tool calls don't hang forever.
+            if (activeTurnRequestId === requestId) {
+              activeTurnRequestId = null;
+              // Resolve any pending tool calls that were part of this turn
+              for (const [callId, pending] of pendingToolCalls) {
+                pending.resolve(JSON.stringify({ error: "Client disconnected" }));
+              }
+              pendingToolCalls.clear();
+            }
           } else {
             globalSSE = null;
           }
@@ -512,6 +546,22 @@ Bun.serve({
         userMessage?: string;
       };
 
+      if (!mcpConnected) {
+        return new Response(
+          JSON.stringify({ error: "Claude Code is not connected. Please restart the session." }),
+          { status: 503, headers: { "content-type": "application/json" } }
+        );
+      }
+
+      // Bug 5 fix: If there's already an active turn, end it before starting a new one.
+      // This prevents the old request's SSE connection from hanging forever.
+      if (activeTurnRequestId) {
+        sendSSE(
+          { type: "error", message: "New message received, previous turn cancelled." },
+          activeTurnRequestId
+        );
+      }
+
       const requestId = `req_${++requestCounter}`;
       activeTurnRequestId = requestId;
 
@@ -525,16 +575,25 @@ Bun.serve({
               .pop()?.content
           : "");
 
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: userMessage ?? "",
-          meta: {
-            computer_id: COMPUTER_ID,
-            request_id: requestId,
+      try {
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: userMessage ?? "",
+            meta: {
+              computer_id: COMPUTER_ID,
+              request_id: requestId,
+            },
           },
-        },
-      });
+        });
+      } catch (err) {
+        mcpConnected = false;
+        activeTurnRequestId = null;
+        return new Response(
+          JSON.stringify({ error: "Failed to reach Claude Code: " + String(err) }),
+          { status: 502, headers: { "content-type": "application/json" } }
+        );
+      }
 
       return new Response(
         JSON.stringify({ requestId }),
@@ -567,6 +626,28 @@ Bun.serve({
     return new Response("Not found", { status: 404 });
   },
 });
+
+// Heartbeat: send keepalive events every 15s to prevent idle connection drops
+setInterval(() => {
+  const heartbeat = `data: ${JSON.stringify({ type: "heartbeat" })}\n\n`;
+  const bytes = new TextEncoder().encode(heartbeat);
+
+  for (const [reqId, conn] of sseConnections) {
+    try {
+      conn.controller.enqueue(bytes);
+    } catch {
+      sseConnections.delete(reqId);
+    }
+  }
+
+  if (globalSSE) {
+    try {
+      globalSSE.controller.enqueue(bytes);
+    } catch {
+      globalSSE = null;
+    }
+  }
+}, 15_000);
 
 // Log to stderr (stdout is reserved for MCP stdio transport)
 console.error(
