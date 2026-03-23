@@ -120,8 +120,15 @@ public class ChannelResourceManager {
 
             // Read output
             String output = new String(p.getInputStream().readAllBytes());
-            int exitCode = p.waitFor();
 
+            // Bug 9 fix: Add timeout to prevent blocking indefinitely
+            boolean finished = p.waitFor(120, java.util.concurrent.TimeUnit.SECONDS);
+            if (!finished) {
+                p.destroyForcibly();
+                return "bun install timed out after 120 seconds";
+            }
+
+            int exitCode = p.exitValue();
             if (exitCode != 0) {
                 ClaudeCraft.LOGGER.error("bun install failed: {}", output);
                 return "bun install failed (exit " + exitCode + "): " + output;
