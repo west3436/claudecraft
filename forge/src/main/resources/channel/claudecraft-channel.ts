@@ -512,6 +512,16 @@ Bun.serve({
         cancel() {
           if (requestId) {
             sseConnections.delete(requestId);
+            // Bug 8 fix: If the disconnected SSE was the active turn,
+            // clean up so pending tool calls don't hang forever.
+            if (activeTurnRequestId === requestId) {
+              activeTurnRequestId = null;
+              // Resolve any pending tool calls that were part of this turn
+              for (const [callId, pending] of pendingToolCalls) {
+                pending.resolve(JSON.stringify({ error: "Client disconnected" }));
+              }
+              pendingToolCalls.clear();
+            }
           } else {
             globalSSE = null;
           }
@@ -540,6 +550,15 @@ Bun.serve({
         return new Response(
           JSON.stringify({ error: "Claude Code is not connected. Please restart the session." }),
           { status: 503, headers: { "content-type": "application/json" } }
+        );
+      }
+
+      // Bug 5 fix: If there's already an active turn, end it before starting a new one.
+      // This prevents the old request's SSE connection from hanging forever.
+      if (activeTurnRequestId) {
+        sendSSE(
+          { type: "error", message: "New message received, previous turn cancelled." },
+          activeTurnRequestId
         );
       }
 

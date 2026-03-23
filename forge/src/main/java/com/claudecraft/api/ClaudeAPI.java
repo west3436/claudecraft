@@ -47,6 +47,10 @@ public class ClaudeAPI implements ILuaAPI {
     private static final Gson GSON = new GsonBuilder().create();
     private static final AtomicLong REQUEST_COUNTER = new AtomicLong(0);
 
+    /** Unique prefix per JVM lifetime to prevent request ID collisions across server restarts. */
+    private static final String REQUEST_ID_PREFIX = "req_" +
+            Long.toHexString(System.nanoTime()).substring(0, 6) + "_";
+
     /** JSON keys that should be arrays when their Lua table is empty. */
     private static final Set<String> ARRAY_KEYS = Set.of(
             "required", "content", "messages", "tools", "stop_sequences", "args", "items"
@@ -213,7 +217,7 @@ public class ClaudeAPI implements ILuaAPI {
         }
 
         // Generate request ID
-        String requestId = "req_" + REQUEST_COUNTER.incrementAndGet();
+        String requestId = REQUEST_ID_PREFIX + REQUEST_COUNTER.incrementAndGet();
 
         // Route to active backend
         ClaudeBackend.StreamHandle handle;
