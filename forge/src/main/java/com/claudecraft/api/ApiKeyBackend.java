@@ -147,6 +147,7 @@ public class ApiKeyBackend implements ClaudeBackend {
         String currentToolName = null;
         StringBuilder currentToolInput = new StringBuilder();
         int inputTokens = 0;
+        boolean receivedTerminalEvent = false;
 
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
@@ -223,6 +224,7 @@ public class ApiKeyBackend implements ClaudeBackend {
                                     }
                                 }
                                 case "message_delta" -> {
+                                    receivedTerminalEvent = true;
                                     JsonObject delta = json.getAsJsonObject("delta");
                                     String stopReason = delta != null && delta.has("stop_reason")
                                             ? delta.get("stop_reason").getAsString() : "end_turn";
@@ -235,6 +237,7 @@ public class ApiKeyBackend implements ClaudeBackend {
                                     // Stream complete
                                 }
                                 case "error" -> {
+                                    receivedTerminalEvent = true;
                                     JsonObject error = json.getAsJsonObject("error");
                                     String msg = error != null && error.has("message")
                                             ? error.get("message").getAsString()
@@ -251,6 +254,12 @@ public class ApiKeyBackend implements ClaudeBackend {
                     dataBuilder.setLength(0);
                 }
             }
+        }
+
+        // Stream ended without a terminal event — connection was lost
+        if (!handle.isCancelled() && !receivedTerminalEvent) {
+            callbacks.onError("Connection closed unexpectedly. The API stream " +
+                    "may have been interrupted or the response exceeded limits.");
         }
     }
 }
