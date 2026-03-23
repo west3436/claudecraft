@@ -182,7 +182,18 @@ public class ChannelBackend implements ClaudeBackend {
 
             HttpResponse<String> response = httpClient.send(request,
                     HttpResponse.BodyHandlers.ofString());
-            return response.statusCode() == 200;
+            if (response.statusCode() != 200) return false;
+
+            // Check that Claude Code MCP connection is still alive
+            try {
+                JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+                if (body.has("mcpConnected") && !body.get("mcpConnected").getAsBoolean()) {
+                    return false;
+                }
+            } catch (Exception ignored) {
+                // Old server format — treat 200 as healthy
+            }
+            return true;
         } catch (Exception e) {
             return false;
         }
@@ -195,6 +206,8 @@ public class ChannelBackend implements ClaudeBackend {
 
     private void parseChannelSSE(java.io.InputStream inputStream, StreamHandle handle,
                                   StreamCallbacks callbacks) throws Exception {
+        boolean receivedTerminalEvent = false;
+
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
 
@@ -229,15 +242,20 @@ public class ChannelBackend implements ClaudeBackend {
                                 callbacks.onReply(text);
                             }
                             case "done" -> {
+                                receivedTerminalEvent = true;
                                 callbacks.onComplete("end_turn", 0, 0);
                                 return;
                             }
                             case "error" -> {
+                                receivedTerminalEvent = true;
                                 String msg = event.has("message")
                                         ? event.get("message").getAsString()
                                         : "Unknown channel error";
                                 callbacks.onError(msg);
                                 return;
+                            }
+                            case "heartbeat" -> {
+                                // Keepalive — ignore
                             }
                         }
                     } catch (Exception e) {
@@ -246,6 +264,12 @@ public class ChannelBackend implements ClaudeBackend {
                     }
                 }
             }
+        }
+
+        // Stream ended without a terminal event — connection was lost
+        if (!handle.isCancelled() && !receivedTerminalEvent) {
+            callbacks.onError("Connection closed unexpectedly. " +
+                    "Claude Code may have crashed or the response exceeded limits.");
         }
     }
 }
