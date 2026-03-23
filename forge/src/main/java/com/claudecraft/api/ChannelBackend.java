@@ -132,11 +132,37 @@ public class ChannelBackend implements ClaudeBackend {
             conn.setConnectTimeout(2000);
             conn.setReadTimeout(2000);
             int code = conn.getResponseCode();
+            if (code != 200) {
+                conn.disconnect();
+                return false;
+            }
+
+            // Check that Claude Code MCP connection is still alive
+            try {
+                String body = readFullStream(conn.getInputStream());
+                JsonObject json = JsonParser.parseString(body).getAsJsonObject();
+                if (json.has("mcpConnected") && !json.get("mcpConnected").getAsBoolean()) {
+                    conn.disconnect();
+                    return false;
+                }
+            } catch (Exception ignored) {
+                // Old server format — treat 200 as healthy
+            }
             conn.disconnect();
-            return code == 200;
+            return true;
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private static String readFullStream(InputStream stream) throws IOException {
+        ByteArrayOutputStream result = new ByteArrayOutputStream();
+        byte[] buffer = new byte[4096];
+        int length;
+        while ((length = stream.read(buffer)) != -1) {
+            result.write(buffer, 0, length);
+        }
+        return result.toString(StandardCharsets.UTF_8.name());
     }
 
     @Override
@@ -187,6 +213,8 @@ public class ChannelBackend implements ClaudeBackend {
 
     private void parseChannelSSE(InputStream inputStream, StreamHandle handle,
                                   StreamCallbacks callbacks) throws Exception {
+        boolean receivedTerminalEvent = false;
+
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
 
@@ -217,14 +245,18 @@ public class ChannelBackend implements ClaudeBackend {
                             String text = event.get("text").getAsString();
                             callbacks.onReply(text);
                         } else if ("done".equals(type)) {
+                            receivedTerminalEvent = true;
                             callbacks.onComplete("end_turn", 0, 0);
                             return;
                         } else if ("error".equals(type)) {
+                            receivedTerminalEvent = true;
                             String msg = event.has("message")
                                     ? event.get("message").getAsString()
                                     : "Unknown channel error";
                             callbacks.onError(msg);
                             return;
+                        } else if ("heartbeat".equals(type)) {
+                            // Keepalive — ignore
                         }
                     } catch (Exception e) {
                         ClaudeCraft.LOGGER.debug("Skipping non-JSON channel SSE data: {}",
@@ -232,6 +264,12 @@ public class ChannelBackend implements ClaudeBackend {
                     }
                 }
             }
+        }
+
+        // Stream ended without a terminal event — connection was lost
+        if (!handle.isCancelled() && !receivedTerminalEvent) {
+            callbacks.onError("Connection closed unexpectedly. " +
+                    "Claude Code may have crashed or the response exceeded limits.");
         }
     }
 }
