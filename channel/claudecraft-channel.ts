@@ -357,6 +357,23 @@ const TURTLE_TOOLS: ToolDef[] = [
       required: ["blocks"],
     },
   },
+  {
+    name: "turtle_goto",
+    description:
+      "Navigate the turtle to target coordinates using GPS and pathfinding. " +
+      "Automatically determines facing direction, digs through obstacles, and " +
+      "moves along each axis (Y first, then X, then Z). Requires GPS satellites " +
+      "in the world. Returns final position and whether the turtle arrived.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "Target X coordinate" },
+        y: { type: "number", description: "Target Y coordinate" },
+        z: { type: "number", description: "Target Z coordinate" },
+      },
+      required: ["x", "y", "z"],
+    },
+  },
 ];
 
 const ALL_TOOLS = IS_TURTLE
@@ -461,8 +478,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   );
 
   // Wait for the mod to POST the result
-  // build_structure can take several minutes for large blueprints
-  const timeoutMs = name === "build_structure" ? 600_000 : 60_000;
+  // build_structure can take several minutes for large blueprints;
+  // turtle_goto may travel long distances, allow 5 minutes
+  const timeoutMs = name === "build_structure" ? 600_000
+    : name === "turtle_goto" ? 300_000
+    : 60_000;
   const result = await new Promise<string>((resolve) => {
     pendingToolCalls.set(callId, { resolve });
 
