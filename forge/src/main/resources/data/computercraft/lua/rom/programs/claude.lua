@@ -216,6 +216,7 @@ function tools.getDefs()
         d[#d+1] = {name="turtle_place", description="Place: place/placeUp/placeDown.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inspect", description="Inspect: inspect/inspectUp/inspectDown/detect*.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inventory", description="Inventory: select/getItemDetail/refuel/drop/suck/etc.", input_schema={type="object",properties={action={type="string"},slot={type="number"},count={type="number"}},required={"action"}}}
+        d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
     return d
 end
@@ -370,6 +371,128 @@ function tools._exec(name, input)
         else local fn=turtle[a]; if fn then local ok,err=fn(input.count); return {success=ok,error=err} end
             return {error="Unknown: "..a}
         end
+    elseif name == "turtle_goto" then
+        if not turtle then return {error="Not a turtle"} end
+        local tx, ty, tz = input.x, input.y, input.z
+        if not (tx and ty and tz) then return {error="x, y, z coordinates required"} end
+        tx, ty, tz = math.floor(tx), math.floor(ty), math.floor(tz)
+
+        -- Get current position via GPS
+        local cx, cy, cz = gps.locate(5)
+        if not cx then return {error="GPS failed - need 4+ GPS hosts in the world"} end
+        cx, cy, cz = math.floor(cx + 0.5), math.floor(cy + 0.5), math.floor(cz + 0.5)
+
+        -- Check fuel
+        local fuel = turtle.getFuelLevel()
+        if fuel ~= "unlimited" then
+            local dist = math.abs(tx - cx) + math.abs(ty - cy) + math.abs(tz - cz)
+            if fuel < dist then
+                return {error="Not enough fuel. Need ~"..dist..", have "..fuel}
+            end
+        end
+
+        -- Facing: 0=south(+z), 1=west(-x), 2=north(-z), 3=east(+x)
+        local facing = nil
+
+        local function detectFacing()
+            local sx, sz = cx, cz
+            -- Try to move forward to detect facing
+            local moved = turtle.forward()
+            if not moved then turtle.dig(); moved = turtle.forward() end
+            if not moved then return false end
+            local nx, ny, nz = gps.locate(5)
+            if not nx then turtle.back(); return false end
+            nx, nz = math.floor(nx + 0.5), math.floor(nz + 0.5)
+            local dx, dz = nx - sx, nz - sz
+            if dz == 1 then facing = 0
+            elseif dx == -1 then facing = 1
+            elseif dz == -1 then facing = 2
+            elseif dx == 1 then facing = 3
+            else turtle.back(); return false end
+            cx, cy, cz = nx, math.floor(ny + 0.5), nz
+            return true
+        end
+
+        local function turnTo(dir)
+            if facing == dir then return end
+            local diff = (dir - facing) % 4
+            if diff == 1 then turtle.turnRight()
+            elseif diff == 2 then turtle.turnRight(); turtle.turnRight()
+            elseif diff == 3 then turtle.turnLeft() end
+            facing = dir
+        end
+
+        local function tryForward()
+            if turtle.forward() then return true end
+            turtle.dig(); if turtle.forward() then return true end
+            -- Entity might be blocking, attack and retry
+            turtle.attack(); return turtle.forward()
+        end
+
+        local function tryUp()
+            if turtle.up() then return true end
+            turtle.digUp(); if turtle.up() then return true end
+            turtle.attackUp(); return turtle.up()
+        end
+
+        local function tryDown()
+            if turtle.down() then return true end
+            turtle.digDown(); if turtle.down() then return true end
+            turtle.attackDown(); return turtle.down()
+        end
+
+        if not detectFacing() then
+            return {error="Could not determine facing direction (blocked on all sides?)"}
+        end
+
+        -- Already there?
+        if cx == tx and cy == ty and cz == tz then
+            return {success=true, position={x=cx, y=cy, z=cz}, steps=0}
+        end
+
+        local steps = 0
+        local maxSteps = math.abs(tx - cx) + math.abs(ty - cy) + math.abs(tz - cz) + 50
+        local stuck = false
+
+        -- Move Y first (safest, avoids terrain)
+        while cy ~= ty and steps < maxSteps and not stuck do
+            steps = steps + 1
+            if ty > cy then
+                if tryUp() then cy = cy + 1 else stuck = true end
+            else
+                if tryDown() then cy = cy - 1 else stuck = true end
+            end
+        end
+
+        -- Move X
+        while cx ~= tx and steps < maxSteps and not stuck do
+            steps = steps + 1
+            if tx > cx then turnTo(3) else turnTo(1) end
+            if tryForward() then
+                cx = cx + (tx > cx and 1 or -1)
+            else stuck = true end
+        end
+
+        -- Move Z
+        while cz ~= tz and steps < maxSteps and not stuck do
+            steps = steps + 1
+            if tz > cz then turnTo(0) else turnTo(2) end
+            if tryForward() then
+                cz = cz + (tz > cz and 1 or -1)
+            else stuck = true end
+        end
+
+        local arrived = cx == tx and cy == ty and cz == tz
+        local result = {
+            success=arrived,
+            position={x=cx, y=cy, z=cz},
+            target={x=tx, y=ty, z=tz},
+            steps=steps,
+            fuelRemaining=turtle.getFuelLevel()
+        }
+        if stuck then result.stuck=true end
+        if steps >= maxSteps then result.error="Exceeded max steps" end
+        return result
     elseif name == "http_request" then
         if not claude.isWebAccessEnabled() then return {error="Web access is disabled in server config"} end
         if not http then return {error="HTTP API not available"} end
