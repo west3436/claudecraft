@@ -142,6 +142,9 @@ public class ClaudeAPI implements ILuaAPI {
 
             channelBackend = new ChannelBackend(session.port);
 
+            // Start a persistent global SSE listener for incoming inter-computer messages.
+            channelBackend.connectGlobalSSE(createChannelCallbacks("incoming"));
+
             ClaudeCraft.LOGGER.info("Channel spawned for computer #{} on port {}",
                     computerId, session.port);
             return new Object[]{true, session.port};
