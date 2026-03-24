@@ -321,6 +321,23 @@ const TURTLE_TOOLS: ToolDef[] = [
       required: ["action"],
     },
   },
+  {
+    name: "turtle_goto",
+    description:
+      "Navigate the turtle to target coordinates using GPS and pathfinding. " +
+      "Automatically determines facing direction, digs through obstacles, and " +
+      "moves along each axis (Y first, then X, then Z). Requires GPS satellites " +
+      "in the world. Returns final position and whether the turtle arrived.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "Target X coordinate" },
+        y: { type: "number", description: "Target Y coordinate" },
+        z: { type: "number", description: "Target Z coordinate" },
+      },
+      required: ["x", "y", "z"],
+    },
+  },
 ];
 
 const ALL_TOOLS = IS_TURTLE
@@ -428,13 +445,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const result = await new Promise<string>((resolve) => {
     pendingToolCalls.set(callId, { resolve });
 
-    // Timeout after 60 seconds
+    // Timeout: turtle_goto may travel long distances, allow 5 minutes
+    const timeout = name === "turtle_goto" ? 300_000 : 60_000;
     setTimeout(() => {
       if (pendingToolCalls.has(callId)) {
         pendingToolCalls.delete(callId);
         resolve(JSON.stringify({ error: "Tool execution timed out" }));
       }
-    }, 60_000);
+    }, timeout);
   });
 
   return { content: [{ type: "text" as const, text: result }] };
