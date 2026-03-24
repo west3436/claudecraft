@@ -30,7 +30,10 @@ public class ToolDefinitions {
             "move_path",
             "get_info",
             "redstone",
-            "peripheral_call"
+            "peripheral_call",
+            "send_message",
+            "scan_area",
+            "automate_redstone"
     ));
 
     /** Additional tools available only on turtles. */
