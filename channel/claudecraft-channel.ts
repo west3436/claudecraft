@@ -47,6 +47,14 @@ const COMPUTER_LABEL = getArg("label", "Computer");
 const IS_TURTLE = hasFlag("turtle");
 const TERM_WIDTH = parseInt(getArg("term-width", "51"), 10);
 const TERM_HEIGHT = parseInt(getArg("term-height", "19"), 10);
+const TOOL_TIMEOUT = parseInt(getArg("tool-timeout", "60"), 10) * 1000;
+
+// Registry file for inter-computer messaging (written by the Java mod)
+const REGISTRY_PATH = (() => {
+  const home =
+    process.env.USERPROFILE || process.env.HOME || ".";
+  return `${home}/.claudecraft/channel-registry.json`;
+})();
 
 // ---------------------------------------------------------------------------
 // State
@@ -74,6 +82,9 @@ let toolCallCounter = 0;
 /** Whether we have an active conversation turn in progress. */
 let activeTurnRequestId: string | null = null;
 
+/** Set of request IDs that originated from incoming inter-computer messages. */
+const incomingRequestIds = new Set<string>();
+
 /** Whether the MCP connection to Claude Code is alive. */
 let mcpConnected = true;
 
@@ -100,8 +111,8 @@ function sendSSE(
     }
   }
 
-  // Also send to global SSE
-  if (globalSSE) {
+  // Send to global SSE only for incoming message events.
+  if (globalSSE && requestId && incomingRequestIds.has(requestId)) {
     try {
       globalSSE.controller.enqueue(bytes);
     } catch {
@@ -257,6 +268,22 @@ const STANDARD_TOOLS: ToolDef[] = [
       required: ["side", "method"],
     },
   },
+  {
+    name: "send_message",
+    description:
+      "Send a message to another CC:Tweaked computer or turtle running Claude Code. " +
+      "Use this to coordinate with other computers — for example, a commander computer " +
+      "can direct turtle swarms, or computers can collaborate on tasks. " +
+      "The target computer's Claude Code session will receive your message and can reply back.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        computerId: { type: "number", description: "The CC:Tweaked computer ID of the target computer" },
+        message: { type: "string", description: "The message text to send to the target computer" },
+      },
+      required: ["computerId", "message"],
+    },
+  },
 ];
 
 const TURTLE_TOOLS: ToolDef[] = [
@@ -376,9 +403,45 @@ const TURTLE_TOOLS: ToolDef[] = [
   },
 ];
 
+const WORLD_TOOLS: ToolDef[] = [
+  {
+    name: "scan_area",
+    description:
+      "Scan the surrounding area for blocks. Uses a block scanner peripheral if available, " +
+      "otherwise uses turtle inspect on all 6 sides. Returns block data for spatial awareness.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        radius: {
+          type: "number",
+          description:
+            "Scan radius (default 1). Only used with block scanner peripheral.",
+        },
+      },
+    },
+  },
+  {
+    name: "automate_redstone",
+    description:
+      "Gather redstone state from all sides and nearby peripherals to help design a redstone circuit. " +
+      "Describe what you want (e.g. 'turn on the lamp when it gets dark') and this tool returns " +
+      "current redstone state and peripheral info so you can plan and deploy the circuit using the redstone tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        description: {
+          type: "string",
+          description: "Natural language description of the desired redstone behavior",
+        },
+      },
+      required: ["description"],
+    },
+  },
+];
+
 const ALL_TOOLS = IS_TURTLE
-  ? [...STANDARD_TOOLS, ...TURTLE_TOOLS]
-  : STANDARD_TOOLS;
+  ? [...STANDARD_TOOLS, ...TURTLE_TOOLS, ...WORLD_TOOLS]
+  : [...STANDARD_TOOLS, ...WORLD_TOOLS];
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -400,6 +463,11 @@ const systemInstructions = [
   `- Be VERY concise — the terminal is only ${TERM_WIDTH}x${TERM_HEIGHT} characters.`,
   `- Write idiomatic CC:Tweaked Lua when writing code.`,
   `- Use tools proactively to explore and accomplish tasks.`,
+  ``,
+  `You can send messages to other computers/turtles using send_message(computerId, message).`,
+  `Messages from other computers arrive as "[Message from Computer #X]:" prefixed text.`,
+  `When you receive a message from another computer, process it and reply — your reply goes to both the player terminal and completes the turn.`,
+  `You can coordinate with other computers to build swarms, delegate tasks, or collaborate.`,
   ``,
   `Player messages arrive as <channel> events. Reply using the "reply" tool with the text you want to display.`,
   `You may call multiple Minecraft tools before replying. When you are done, ALWAYS call the reply tool.`,
@@ -450,6 +518,31 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: toolArgs } = req.params;
 
+  // Handle send_message tool
+  if (name === "send_message") {
+    const { computerId, message } = toolArgs as { computerId: number; message: string };
+    try {
+      const registryData = await Bun.file(REGISTRY_PATH).text();
+      const registry: Record<string, number> = JSON.parse(registryData);
+      const targetPort = registry[String(computerId)];
+      if (targetPort === undefined) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Computer #${computerId} is not online or not running Claude Code in channel mode.` }) }] };
+      }
+      const resp = await fetch(`http://127.0.0.1:${targetPort}/incoming-message`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ fromComputerId: COMPUTER_ID, fromLabel: COMPUTER_LABEL, message }),
+      });
+      if (!resp.ok) {
+        const errText = await resp.text();
+        return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Failed to deliver message: HTTP ${resp.status} — ${errText}` }) }] };
+      }
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, delivered: true, targetComputerId: computerId }) }] };
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return { content: [{ type: "text" as const, text: JSON.stringify({ error: `Could not send message: ${msg}` }) }] };
+    }
+  }
+
   // Handle reply tool
   if (name === "reply") {
     const text = (toolArgs as { text: string }).text;
@@ -457,6 +550,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (reqId) {
       sendSSE({ type: "reply", text }, reqId);
       sendSSE({ type: "done" }, reqId);
+      incomingRequestIds.delete(reqId);
       activeTurnRequestId = null;
     }
     return { content: [{ type: "text" as const, text: "Reply sent." }] };
@@ -482,7 +576,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   // turtle_goto may travel long distances, allow 5 minutes
   const timeoutMs = name === "build_structure" ? 600_000
     : name === "turtle_goto" ? 300_000
-    : 60_000;
+    : TOOL_TIMEOUT;
   const result = await new Promise<string>((resolve) => {
     pendingToolCalls.set(callId, { resolve });
 
@@ -656,6 +750,21 @@ Bun.serve({
         JSON.stringify({ requestId }),
         { headers: { "content-type": "application/json" } }
       );
+    }
+
+    // --- Incoming message from another computer ---
+    if (req.method === "POST" && url.pathname === "/incoming-message") {
+      const body = (await req.json()) as { fromComputerId: string; fromLabel: string; message: string };
+      const requestId = `req_${++requestCounter}`;
+      activeTurnRequestId = requestId;
+      incomingRequestIds.add(requestId);
+      const incomingText = `[Message from Computer #${body.fromComputerId} "${body.fromLabel}"]: ${body.message}`;
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: { content: incomingText, meta: { computer_id: COMPUTER_ID, request_id: requestId, from_computer_id: body.fromComputerId } },
+      });
+      sendSSE({ type: "incoming_message", fromComputerId: body.fromComputerId, fromLabel: body.fromLabel }, requestId);
+      return new Response(JSON.stringify({ ok: true, requestId }), { headers: { "content-type": "application/json" } });
     }
 
     // --- Receive tool result from mod ---

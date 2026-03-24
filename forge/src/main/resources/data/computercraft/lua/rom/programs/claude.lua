@@ -33,6 +33,51 @@ function hist.clear()
 end
 
 ----------------------------------------------------------------------
+-- TOKEN & COST TRACKING
+----------------------------------------------------------------------
+local stats = {totalIn=0, totalOut=0, requests=0}
+
+local function estimateCost(inp, out)
+    -- Approximate costs per million tokens (Sonnet-class pricing)
+    return (inp * 3.0 / 1000000) + (out * 15.0 / 1000000)
+end
+
+----------------------------------------------------------------------
+-- ACHIEVEMENT / PROGRESS TRACKING
+----------------------------------------------------------------------
+local progress = {}
+local PROGRESS_FILE = "/.claude/progress.json"
+
+function progress.load()
+    if not fs.exists(PROGRESS_FILE) then
+        return {blocks_mined=0, blocks_placed=0, items_crafted=0, files_written=0, commands_run=0, moves=0, tools_used=0}
+    end
+    local f = fs.open(PROGRESS_FILE, "r"); if not f then return {blocks_mined=0, blocks_placed=0, items_crafted=0, files_written=0, commands_run=0, moves=0, tools_used=0} end
+    local c = f.readAll(); f.close()
+    local ok, d = pcall(textutils.unserialiseJSON, c)
+    if ok and type(d) == "table" then return d end
+    return {blocks_mined=0, blocks_placed=0, items_crafted=0, files_written=0, commands_run=0, moves=0, tools_used=0}
+end
+
+function progress.save(p)
+    ensureDir()
+    local f = fs.open(PROGRESS_FILE, "w"); if f then f.write(textutils.serialiseJSON(p)); f.close() end
+end
+
+function progress.track(toolName, result)
+    local p = progress.load()
+    p.tools_used = (p.tools_used or 0) + 1
+    if toolName == "turtle_dig" and result and result.success then p.blocks_mined = (p.blocks_mined or 0) + 1
+    elseif toolName == "turtle_place" and result and result.success then p.blocks_placed = (p.blocks_placed or 0) + 1
+    elseif toolName == "write_file" and result and result.success then p.files_written = (p.files_written or 0) + 1
+    elseif toolName == "run_command" then p.commands_run = (p.commands_run or 0) + 1
+    elseif toolName == "turtle_move" and result and result.results then p.moves = (p.moves or 0) + (result.completed or 0)
+    elseif toolName == "turtle_goto" and result and result.success then p.moves = (p.moves or 0) + (result.steps or 0)
+    end
+    progress.save(p)
+end
+
+----------------------------------------------------------------------
 -- UI
 ----------------------------------------------------------------------
 local ui = {}
@@ -208,6 +253,8 @@ function tools.getDefs()
         {name="get_recipes", description="Get Minecraft crafting/smelting/smithing recipes from the server. Returns all recipes, optionally filtered by output item name or recipe type.", input_schema={type="object",properties={item={type="string",description="Filter by output item (e.g. 'iron_pickaxe', 'diamond')"},type={type="string",description="Filter by recipe type (e.g. 'crafting', 'smelting', 'smithing')"}}}},
         {name="scan_inventory", description="Scan a container's inventory (chest, barrel, shulker box, etc.) via peripheral. Returns all items with slot, name, and count. Use with get_recipes to plan crafting sequences — find available materials across nearby chests, then craft intermediate and final items.", input_schema={type="object",properties={peripheral={type="string",description="Peripheral name or side (e.g. 'minecraft:chest_0', 'left')"},detailed={type="boolean",description="If true, fetch full item details per slot including displayName, nbt, tags (slower). Default: false"}},required={"peripheral"}}},
     }
+    d[#d+1] = {name="scan_area", description="Scan surrounding area for blocks. Uses block scanner peripheral if available, otherwise turtle inspect on all 6 sides.", input_schema={type="object",properties={radius={type="number",description="Scan radius (default 1). Only used with block scanner peripheral."}}}}
+    d[#d+1] = {name="automate_redstone", description="Gather redstone state and peripheral info from all sides to help design a redstone circuit. Describe desired behavior in natural language.", input_schema={type="object",properties={description={type="string",description="Natural language description of desired redstone behavior"}},required={"description"}}}
     if claude.isWebAccessEnabled() and http then
         d[#d+1] = {name="http_request", description="Make an HTTP request. Returns response body (max 64KB).", input_schema={type="object",properties={url={type="string",description="The URL to request"},method={type="string",description="HTTP method (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS). Default: GET"},body={type="string",description="Request body (for POST/PUT/PATCH)"},headers={type="object",description="Request headers as key-value pairs"}},required={"url"}}}
     end
@@ -226,6 +273,7 @@ end
 function tools.exec(name, input)
     local ok, r = pcall(tools._exec, name, input)
     if not ok then return {error=tostring(r)} end
+    progress.track(name, r)
     return r
 end
 
@@ -690,6 +738,81 @@ function tools._exec(name, input)
         local ok2, data = pcall(textutils.unserialiseJSON, json)
         if ok2 and data then return data end
         return {error="Failed to parse recipe data"}
+    elseif name == "scan_area" then
+        local radius = input.radius or 1
+        local result = {blocks={}}
+        -- Try block scanner peripheral first
+        local scanner = nil
+        for _, pName in ipairs(peripheral.getNames()) do
+            local pType = peripheral.getType(pName)
+            if pType and (pType:find("scanner") or pType:find("plethora")) then
+                scanner = peripheral.wrap(pName)
+                break
+            end
+        end
+        if scanner and scanner.scan then
+            local ok2, data = pcall(scanner.scan, radius)
+            if ok2 and data then
+                for _, block in ipairs(data) do
+                    result.blocks[#result.blocks+1] = {x=block.x, y=block.y, z=block.z, name=block.name or "unknown"}
+                end
+                result.method = "scanner"
+                result.radius = radius
+                result.count = #result.blocks
+                return result
+            end
+        end
+        -- Fall back to turtle inspect on all sides
+        if turtle then
+            local sides = {
+                {action="inspect", dir="front"}, {action="inspectUp", dir="up"}, {action="inspectDown", dir="down"},
+            }
+            for _, s in ipairs(sides) do
+                local ok2, data = turtle[s.action]()
+                if ok2 then result.blocks[#result.blocks+1] = {direction=s.dir, name=data.name, state=data.state} end
+            end
+            -- Also inspect left, right, back by turning
+            turtle.turnLeft()
+            local ok2, data = turtle.inspect()
+            if ok2 then result.blocks[#result.blocks+1] = {direction="left", name=data.name, state=data.state} end
+            turtle.turnRight(); turtle.turnRight()
+            ok2, data = turtle.inspect()
+            if ok2 then result.blocks[#result.blocks+1] = {direction="right", name=data.name, state=data.state} end
+            turtle.turnRight(); turtle.turnRight()
+            ok2, data = turtle.inspect()
+            if ok2 then result.blocks[#result.blocks+1] = {direction="back", name=data.name, state=data.state} end
+            turtle.turnLeft() -- return to original facing
+            result.method = "turtle_inspect"
+        else
+            -- Standard computer: check peripherals
+            local sides = {"top","bottom","left","right","front","back"}
+            for _, s in ipairs(sides) do
+                if peripheral.isPresent(s) then
+                    result.blocks[#result.blocks+1] = {direction=s, type=peripheral.getType(s)}
+                end
+            end
+            result.method = "peripheral_scan"
+        end
+        result.count = #result.blocks
+        return result
+    elseif name == "automate_redstone" then
+        local result = {description=input.description, sides={}, peripherals={}}
+        local sides = {"top","bottom","left","right","front","back"}
+        for _, s in ipairs(sides) do
+            result.sides[s] = {
+                input=redstone.getInput(s),
+                output=redstone.getOutput(s),
+                analogInput=redstone.getAnalogInput(s),
+                analogOutput=redstone.getAnalogOutput(s),
+            }
+            if peripheral.isPresent(s) then
+                result.peripherals[#result.peripherals+1] = {side=s, type=peripheral.getType(s)}
+            end
+        end
+        result.time = os.time()
+        result.day = os.day()
+        result.hint = "Use the redstone tool with setOutput/setAnalogOutput to implement the circuit. For time-based automation, write a Lua program that runs in a loop."
+        return result
     else
         return {error="Unknown tool: "..name}
     end
@@ -841,11 +964,18 @@ end
 
 local model = claude.getModel()
 
+-- Personality support
+local personality = claude.getPersonality()
+
 -- System prompt
-local sysPr = string.format(
+local sysPr = ""
+if personality and #personality > 0 then
+    sysPr = personality .. "\n\n"
+end
+sysPr = sysPr .. string.format(
     "You are Claude Code, an AI assistant inside a ComputerCraft computer in Minecraft. " ..
     "ID: %d. Label: %s. Terminal: %dx%d. %s" ..
-    "You have tools for files, search, shell, %s%sredstone, peripherals, inventory scanning, and Minecraft recipes.\n" ..
+    "You have tools for files, search, shell, %s%sredstone, peripherals, inventory scanning, area scanning, and Minecraft recipes.\n" ..
     "Be VERY concise (tiny terminal). Use tools proactively. Write idiomatic CC:Tweaked Lua.\n" ..
     "NEVER use emojis - the terminal cannot display them (they show as ?). " ..
     "NEVER use markdown formatting (no **, no ##, no ```) - this is a plain text terminal, not a markdown renderer. " ..
@@ -920,6 +1050,22 @@ local function main()
     local msgs = hist.load() or {}
     if #msgs > 0 then ui.add("("..#msgs.." msgs loaded)", C.sep); ui.drawBody() end
 
+    -- Startup task / autonomous mode: auto-send /.claude/startup file contents
+    local STARTUP_FILE = "/.claude/startup"
+    if fs.exists(STARTUP_FILE) then
+        local sf = fs.open(STARTUP_FILE, "r")
+        if sf then
+            local startupMsg = sf.readAll(); sf.close()
+            if startupMsg and #startupMsg > 0 then
+                startupMsg = startupMsg:match("^%s*(.-)%s*$") -- trim
+                if #startupMsg > 0 then
+                    ui.add("Auto-startup: "..startupMsg:sub(1, sW-15), C.info); ui.drawBody()
+                    os.queueEvent("paste", startupMsg)
+                end
+            end
+        end
+    end
+
     while true do
         local inp = ui.readInput()
         if not inp or inp == "exit" or inp == "quit" then break end
@@ -933,15 +1079,57 @@ local function main()
         end
         if inp == "/help" then
             ui.add("Commands:", C.info)
-            ui.add("  /clear - Reset conversation", C.ai)
-            ui.add("  /mode  - Change connection mode", C.ai)
-            ui.add("  /help  - This help", C.ai)
-            ui.add("  exit   - Quit", C.ai)
+            ui.add("  /clear    - Reset conversation", C.ai)
+            ui.add("  /mode     - Change connection mode", C.ai)
+            ui.add("  /stats    - Token usage & cost", C.ai)
+            ui.add("  /search X - Search chat history", C.ai)
+            ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /help     - This help", C.ai)
+            ui.add("  exit      - Quit", C.ai)
             ui.add("Scroll: mouse wheel / PgUp/PgDn", C.ai)
             ui.blank()
             ui.add("Setup & FAQ:", C.info)
             ui.add("github.com/west3436/claudecraft", C.sep)
             ui.add("  /docs/channel-mode.md", C.sep)
+            ui.blank(); ui.drawBody(); goto continue
+        end
+
+        if inp == "/stats" then
+            ui.add("Session Stats:", C.info)
+            ui.add(string.format("  Requests: %d", stats.requests), C.ai)
+            ui.add(string.format("  Tokens in:  %d", stats.totalIn), C.ai)
+            ui.add(string.format("  Tokens out: %d", stats.totalOut), C.ai)
+            ui.add(string.format("  Est. cost:  $%.4f", estimateCost(stats.totalIn, stats.totalOut)), C.ai)
+            ui.blank(); ui.drawBody(); goto continue
+        end
+
+        if inp:match("^/search%s+") then
+            local term = inp:match("^/search%s+(.+)$")
+            if not term then ui.add("Usage: /search <term>", C.err); ui.drawBody(); goto continue end
+            local found = 0
+            for i, m in ipairs(msgs) do
+                local content = type(m.content) == "string" and m.content or ""
+                if content:lower():find(term:lower(), 1, true) then
+                    found = found + 1
+                    local prefix = m.role == "user" and "> " or "  "
+                    local line = prefix .. content:sub(1, sW - 4)
+                    ui.add(line, m.role == "user" and C.user or C.ai)
+                    if found >= 10 then ui.add("  ...(more matches)", C.sep); break end
+                end
+            end
+            if found == 0 then ui.add("No matches for: "..term, C.sep) end
+            ui.blank(); ui.drawBody(); goto continue
+        end
+
+        if inp == "/progress" then
+            local p = progress.load()
+            ui.add("Progress:", C.info)
+            ui.add(string.format("  Tools used:    %d", p.tools_used or 0), C.ai)
+            ui.add(string.format("  Blocks mined:  %d", p.blocks_mined or 0), C.ai)
+            ui.add(string.format("  Blocks placed: %d", p.blocks_placed or 0), C.ai)
+            ui.add(string.format("  Files written: %d", p.files_written or 0), C.ai)
+            ui.add(string.format("  Commands run:  %d", p.commands_run or 0), C.ai)
+            ui.add(string.format("  Steps moved:   %d", p.moves or 0), C.ai)
             ui.blank(); ui.drawBody(); goto continue
         end
 
@@ -987,6 +1175,12 @@ local function main()
                     term.setCursorPos(1,sH); term.clearLine()
                     if #responseText > 0 then
                         ui.add(responseText, C.ai); ui.blank()
+                    end
+                    -- p2=stopReason, p3=inputTokens, p4=outputTokens
+                    stats.requests = stats.requests + 1
+                    if p3 and p4 then
+                        stats.totalIn = stats.totalIn + (p3 or 0)
+                        stats.totalOut = stats.totalOut + (p4 or 0)
                     end
                     ui.drawBody()
 
@@ -1056,6 +1250,11 @@ local function main()
                         if responseText and #responseText > 0 then
                             ui.add(responseText, C.ai); ui.blank()
                         end
+                        stats.requests = stats.requests + 1
+                        if p3 and p4 then
+                            stats.totalIn = stats.totalIn + (p3 or 0)
+                            stats.totalOut = stats.totalOut + (p4 or 0)
+                        end
                         if p3 and p4 and (p3 > 0 or p4 > 0) then
                             ui.add(string.format("(%s in / %s out)", tostring(p3), tostring(p4)), C.sep)
                         end
@@ -1117,6 +1316,27 @@ local function main()
     term.clear(); term.setCursorPos(1,1); print("Session ended.")
 end
 
+local function incomingMessageHandler()
+    while true do
+        local ev, p1, p2, p3, p4 = os.pullEvent()
+        if ev == "claude_tool_exec" and p1 == "incoming" then
+            local input = {}
+            if p4 then
+                local ok2, parsed = pcall(textutils.unserialiseJSON, p4)
+                if ok2 and parsed then input = parsed end
+            end
+            showToolCall(p3, input)
+            local r = tools.exec(p3, input)
+            showToolResult(p3, r)
+            claude.sendToolResult(p1, p2, textutils.serialiseJSON(r))
+        elseif ev == "claude_text" and p1 == "incoming" then
+            ui.add(p2, C.ai); ui.blank(); ui.drawBody()
+        elseif ev == "claude_done" and p1 == "incoming" then
+            ui.drawBody(); ui.drawInput()
+        end
+    end
+end
+
 parallel.waitForAny(main, function()
     while true do
         local ev, p1 = os.pullEvent()
@@ -1130,4 +1350,4 @@ parallel.waitForAny(main, function()
             if monitor then ui.drawMonitor() end
         end
     end
-end)
+end, incomingMessageHandler)

@@ -80,46 +80,68 @@ public class ApiKeyBackend implements ClaudeBackend {
             handle.setRequestThread(Thread.currentThread());
             HttpURLConnection connection = null;
             try {
-                URL url = new URL(API_URL);
-                connection = (HttpURLConnection) url.openConnection();
-                connection.setRequestMethod("POST");
-                connection.setDoOutput(true);
-                connection.setConnectTimeout(15000);
-                connection.setReadTimeout(timeout * 1000);
-                connection.setRequestProperty("x-api-key", apiKey);
-                connection.setRequestProperty("anthropic-version", API_VERSION);
-                connection.setRequestProperty("content-type", "application/json");
+                int maxRetries = 2;
+                int attempt = 0;
+                while (true) {
+                    if (handle.isCancelled()) return;
 
-                // Write request body
-                byte[] bodyBytes = bodyString.getBytes(StandardCharsets.UTF_8);
-                connection.setFixedLengthStreamingMode(bodyBytes.length);
-                try (OutputStream os = connection.getOutputStream()) {
-                    os.write(bodyBytes);
-                    os.flush();
-                }
+                    URL url = new URL(API_URL);
+                    connection = (HttpURLConnection) url.openConnection();
+                    connection.setRequestMethod("POST");
+                    connection.setDoOutput(true);
+                    connection.setConnectTimeout(15000);
+                    connection.setReadTimeout(timeout * 1000);
+                    connection.setRequestProperty("x-api-key", apiKey);
+                    connection.setRequestProperty("anthropic-version", API_VERSION);
+                    connection.setRequestProperty("content-type", "application/json");
 
-                int statusCode = connection.getResponseCode();
-                if (statusCode != 200) {
-                    InputStream errorStream = connection.getErrorStream();
-                    String errorBody = readFullStream(errorStream != null ? errorStream : connection.getInputStream());
-                    String msg = "HTTP " + statusCode;
-                    try {
-                        JsonObject err = JsonParser.parseString(errorBody).getAsJsonObject();
-                        if (err.has("error")) {
-                            JsonObject errObj = err.getAsJsonObject("error");
-                            if (errObj.has("message")) {
-                                msg = errObj.get("message").getAsString();
-                            }
-                        }
-                    } catch (Exception ignored) {
-                        if (errorBody.length() < 300) msg = errorBody;
+                    // Write request body
+                    byte[] bodyBytes = bodyString.getBytes(StandardCharsets.UTF_8);
+                    connection.setFixedLengthStreamingMode(bodyBytes.length);
+                    try (OutputStream os = connection.getOutputStream()) {
+                        os.write(bodyBytes);
+                        os.flush();
                     }
-                    callbacks.onError(msg);
+
+                    int statusCode = connection.getResponseCode();
+
+                    // Retry on 429 (rate limit) or 5xx (server error) with exponential backoff
+                    if ((statusCode == 429 || statusCode >= 500) && attempt < maxRetries) {
+                        InputStream errorStream = connection.getErrorStream();
+                        if (errorStream != null) errorStream.close();
+                        connection.disconnect();
+                        connection = null;
+                        attempt++;
+                        long backoffMs = 1000L * (1L << (attempt - 1)); // 1s, 2s
+                        ClaudeCraft.LOGGER.warn("HTTP {} from API, retrying in {}ms (attempt {}/{})",
+                                statusCode, backoffMs, attempt, maxRetries);
+                        Thread.sleep(backoffMs);
+                        continue;
+                    }
+
+                    if (statusCode != 200) {
+                        InputStream errorStream = connection.getErrorStream();
+                        String errorBody = readFullStream(errorStream != null ? errorStream : connection.getInputStream());
+                        String msg = "HTTP " + statusCode;
+                        try {
+                            JsonObject err = JsonParser.parseString(errorBody).getAsJsonObject();
+                            if (err.has("error")) {
+                                JsonObject errObj = err.getAsJsonObject("error");
+                                if (errObj.has("message")) {
+                                    msg = errObj.get("message").getAsString();
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            if (errorBody.length() < 300) msg = errorBody;
+                        }
+                        callbacks.onError(msg);
+                        return;
+                    }
+
+                    // Parse SSE stream line-by-line
+                    parseSSEStream(connection.getInputStream(), handle, callbacks);
                     return;
                 }
-
-                // Parse SSE stream line-by-line
-                parseSSEStream(connection.getInputStream(), handle, callbacks);
 
             } catch (InterruptedException e) {
                 if (!handle.isCancelled()) {

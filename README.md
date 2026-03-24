@@ -29,11 +29,21 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 - **Streaming responses** — see Claude's output in real time on the terminal
 - **Tool use** — Claude can read/write files, run shell commands, control redstone, interact with peripherals, and pilot turtles
 - **Inventory scanning** — scan chests, barrels, and shulker boxes for items via peripheral
+- **Area scanning** — scan surrounding blocks using scanner peripherals or turtle inspect
 - **GPS navigation** — turtles can navigate to coordinates with pathfinding, digging through obstacles
 - **Blueprint building** — execute multi-block builds from blueprints with relative coordinates
+- **Inter-computer messaging** — send messages between computers for multi-computer coordination and turtle swarms
+- **Redstone automation** — gather redstone state and peripheral info to help design circuits
+- **Personality system** — configure a custom personality for the AI via the mod config
+- **Startup tasks** — place a `/.claude/startup` file to auto-send a message on launch for autonomous operation
+- **Token & cost tracking** — track token usage and estimated costs per session with `/stats`
+- **Progress tracking** — track blocks mined, placed, files written, and more with `/progress`
+- **Chat search** — search conversation history with `/search <term>`
+- **Auto-retry** — automatic retry with exponential backoff on rate limits and server errors
+- **Configurable tool timeout** — adjust how long tools can run before timing out
 - **Monitor support** — automatically uses connected monitors for a larger display
 - **Conversation history** — persistent chat history stored per computer
-- **Configurable** — choose model, max tokens, system prompt, and concurrency limits
+- **Configurable** — choose model, max tokens, system prompt, personality, and concurrency limits
 
 ## Tools
 
@@ -56,6 +66,9 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 | `peripheral_call` | Call a method on a connected peripheral |
 | `get_recipes` | Look up crafting recipes |
 | `scan_inventory` | Scan containers (chests, barrels, shulker boxes) for items via peripheral |
+| `scan_area` | Scan surrounding blocks using scanner peripheral or turtle inspect |
+| `automate_redstone` | Gather redstone state and peripheral info for circuit design |
+| `send_message` | Send a message to another computer for multi-computer coordination |
 
 ### Turtle
 
@@ -68,6 +81,17 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 | `turtle_inventory` | Manage the turtle's inventory |
 | `turtle_goto` | Navigate to GPS coordinates with pathfinding |
 | `build_structure` | Execute multi-block builds from blueprints |
+
+## Chat Commands
+
+| Command | Description |
+|---|---|
+| `/clear` | Reset conversation history |
+| `/mode` | Change connection mode |
+| `/stats` | Show token usage and estimated cost |
+| `/search <term>` | Search chat history |
+| `/progress` | Show achievement statistics |
+| `/help` | Show available commands |
 
 ## In-Game Commands
 
