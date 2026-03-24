@@ -1,6 +1,7 @@
 package com.claudecraft.channel;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.config.ClaudeCraftConfig;
 
 import java.net.InetSocketAddress;
 import java.net.Socket;
@@ -290,7 +291,8 @@ public class ChannelProcessManager {
         args.append("      \"--computer-id\", \"").append(computerId).append("\",\n");
         args.append("      \"--label\", \"").append(escapedLabel).append("\",\n");
         args.append("      \"--term-width\", \"").append(termWidth).append("\",\n");
-        args.append("      \"--term-height\", \"").append(termHeight).append("\"");
+        args.append("      \"--term-height\", \"").append(termHeight).append("\",\n");
+        args.append("      \"--tool-timeout\", \"").append(ClaudeCraftConfig.TOOL_TIMEOUT_SECONDS.get()).append("\"");
         if (isTurtle) {
             args.append(",\n      \"--turtle\"");
         }
