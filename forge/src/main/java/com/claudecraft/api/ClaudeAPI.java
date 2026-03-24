@@ -140,6 +140,7 @@ public class ClaudeAPI implements ILuaAPI {
                             computerId, isTurtle, label, termW, termH);
 
             channelBackend = new ChannelBackend(session.port);
+            channelBackend.connectGlobalSSE(createChannelCallbacks("incoming"));
 
             ClaudeCraft.LOGGER.info("Channel spawned for computer #{} on port {}",
                     computerId, session.port);

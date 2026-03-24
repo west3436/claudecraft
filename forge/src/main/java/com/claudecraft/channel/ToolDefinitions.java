@@ -28,7 +28,8 @@ public class ToolDefinitions {
             "move_path",
             "get_info",
             "redstone",
-            "peripheral_call"
+            "peripheral_call",
+            "send_message"
     );
 
     /** Additional tools available only on turtles. */
