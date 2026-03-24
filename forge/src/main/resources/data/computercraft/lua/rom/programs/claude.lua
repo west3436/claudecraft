@@ -217,6 +217,7 @@ function tools.getDefs()
         d[#d+1] = {name="turtle_place", description="Place: place/placeUp/placeDown.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inspect", description="Inspect: inspect/inspectUp/inspectDown/detect*.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inventory", description="Inventory: select/getItemDetail/refuel/drop/suck/etc.", input_schema={type="object",properties={action={type="string"},slot={type="number"},count={type="number"}},required={"action"}}}
+        d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
     return d
@@ -372,6 +373,139 @@ function tools._exec(name, input)
         else local fn=turtle[a]; if fn then local ok,err=fn(input.count); return {success=ok,error=err} end
             return {error="Unknown: "..a}
         end
+    elseif name == "build_structure" then
+        if not turtle then return {error="Not a turtle"} end
+        local blocks = input.blocks
+        if not blocks or #blocks == 0 then return {error="No blocks in blueprint"} end
+
+        -- Position and facing state (relative to start)
+        local px, py, pz = 0, 0, 0
+        -- Facing: 0=+z(forward), 1=+x(right), 2=-z(back), 3=-x(left)
+        local face = 0
+        local dxMap = {[0]=0, [1]=1, [2]=0, [3]=-1}
+        local dzMap = {[0]=1, [1]=0, [2]=-1, [3]=0}
+
+        local function turnTo(dir)
+            dir = dir % 4
+            while face ~= dir do
+                local diff = (dir - face) % 4
+                if diff == 1 then
+                    turtle.turnRight()
+                    face = (face + 1) % 4
+                else
+                    turtle.turnLeft()
+                    face = (face + 3) % 4
+                end
+            end
+        end
+
+        local function tryForward()
+            if turtle.forward() then
+                px = px + dxMap[face]
+                pz = pz + dzMap[face]
+                return true
+            end
+            return false
+        end
+
+        local function tryUp()
+            if turtle.up() then py = py + 1; return true end
+            return false
+        end
+
+        local function tryDown()
+            if turtle.down() then py = py - 1; return true end
+            return false
+        end
+
+        local function digForward()
+            turtle.dig()
+            return tryForward()
+        end
+
+        local function digUp()
+            turtle.digUp()
+            return tryUp()
+        end
+
+        local function digDown()
+            turtle.digDown()
+            return tryDown()
+        end
+
+        local function goTo(tx, ty, tz)
+            -- Move Y first (up before horizontal to clear obstacles)
+            while py < ty do if not tryUp() then if not digUp() then return false end end end
+            while py > ty do if not tryDown() then if not digDown() then return false end end end
+            -- Move X
+            if px ~= tx then
+                if px < tx then turnTo(1) else turnTo(3) end
+                while px ~= tx do if not tryForward() then if not digForward() then return false end end end
+            end
+            -- Move Z
+            if pz ~= tz then
+                if pz < tz then turnTo(0) else turnTo(2) end
+                while pz ~= tz do if not tryForward() then if not digForward() then return false end end end
+            end
+            return true
+        end
+
+        local function findSlot(blockName)
+            for s = 1, 16 do
+                local item = turtle.getItemDetail(s)
+                if item and (item.name == blockName or item.name == "minecraft:"..blockName or "minecraft:"..item.name == blockName) then
+                    if turtle.getItemCount(s) > 0 then return s end
+                end
+            end
+            return nil
+        end
+
+        -- Sort blocks: bottom-up by Y, then serpentine X/Z for efficiency
+        table.sort(blocks, function(a, b)
+            if a.y ~= b.y then return a.y < b.y end
+            -- Serpentine: alternate Z direction per X row
+            if a.x ~= b.x then return a.x < b.x end
+            if a.x % 2 == 0 then return a.z < b.z
+            else return a.z > b.z end
+        end)
+
+        local placed = 0
+        local failed = {}
+        local missing = {}
+
+        for i, block in ipairs(blocks) do
+            local slot = findSlot(block.block)
+            if not slot then
+                missing[#missing+1] = {x=block.x, y=block.y, z=block.z, block=block.block}
+            else
+                turtle.select(slot)
+                -- Navigate to one above target and place down
+                if goTo(block.x, block.y + 1, block.z) then
+                    -- Dig down if something is in the way
+                    if turtle.detectDown() then turtle.digDown() end
+                    if turtle.placeDown() then
+                        placed = placed + 1
+                    else
+                        failed[#failed+1] = {x=block.x, y=block.y, z=block.z, reason="place failed"}
+                    end
+                else
+                    failed[#failed+1] = {x=block.x, y=block.y, z=block.z, reason="nav failed"}
+                end
+            end
+            -- Yield periodically to avoid "too long without yielding"
+            if i % 10 == 0 then os.queueEvent("bp_yield"); os.pullEvent("bp_yield") end
+        end
+
+        -- Return to origin
+        goTo(0, math.max(py, 1), 0)
+        goTo(0, 0, 0)
+        turnTo(0)
+
+        return {
+            total=#blocks, placed=placed,
+            failed=#failed > 0 and failed or nil,
+            missing=#missing > 0 and missing or nil
+        }
     elseif name == "turtle_goto" then
         if not turtle then return {error="Not a turtle"} end
         local tx, ty, tz = input.x, input.y, input.z
