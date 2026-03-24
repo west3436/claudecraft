@@ -138,6 +138,7 @@ public class ChannelProcessManager {
 
         SessionInfo session = new SessionInfo(computerId, port, process);
         sessions.put(computerId, session);
+        writeRegistry();
 
         return session;
     }
@@ -150,6 +151,7 @@ public class ChannelProcessManager {
         if (session == null) return;
 
         ClaudeCraft.LOGGER.info("Stopping Claude Code session for computer #{}", computerId);
+        writeRegistry();
 
         // The 'start' command detaches the process, so Process.destroy() won't work.
         // Instead, kill any claude process that was started from this computer's sandbox.
@@ -209,6 +211,25 @@ public class ChannelProcessManager {
         }
     }
 
+    private void writeRegistry() {
+        try {
+            Path registryFile = Path.of(System.getProperty("user.home"),
+                    ".claudecraft", "channel-registry.json");
+            Files.createDirectories(registryFile.getParent());
+            StringBuilder json = new StringBuilder("{\n");
+            boolean first = true;
+            for (var entry : sessions.entrySet()) {
+                if (!first) json.append(",\n");
+                json.append("  \"").append(entry.getKey()).append("\": ").append(entry.getValue().port);
+                first = false;
+            }
+            json.append("\n}");
+            Files.writeString(registryFile, json.toString());
+        } catch (Exception e) {
+            ClaudeCraft.LOGGER.warn("Failed to write channel registry: {}", e.getMessage());
+        }
+    }
+
     private void writeCLAUDEmd(Path dir, int computerId, boolean isTurtle, String label,
                                 int termWidth, int termHeight) throws Exception {
         String turtleTools = isTurtle
@@ -226,13 +247,19 @@ public class ChannelProcessManager {
                    You do NOT have access to the host filesystem.
                 3. ONLY use the Minecraft tools provided by the ClaudeCraft channel:
                    read_file, write_file, edit_file, list_files, find_files, search_content,
-                   run_command, delete_path, move_path, get_info, redstone, peripheral_call%s
+                   run_command, delete_path, move_path, get_info, redstone, peripheral_call,
+                   send_message%s
                 4. Your filesystem IS the CC:Tweaked virtual filesystem. Paths start with /.
                 5. NEVER use emojis - the terminal cannot display them.
                 6. NEVER use markdown formatting - this is a plain text terminal.
                 7. Be VERY concise - your terminal is %dx%d characters.
                 8. Write idiomatic CC:Tweaked Lua when writing code.
                 9. When you are done responding, ALWAYS call the reply tool.
+
+                ## Inter-Computer Messaging
+                You can send messages to other computers/turtles using send_message(computerId, message).
+                Messages from other computers arrive as "[Message from Computer #X]:" prefixed text.
+                Use this to coordinate with other AI agents — build turtle swarms, delegate tasks, or collaborate.
 
                 ## Computer Info
                 - Computer ID: %d
