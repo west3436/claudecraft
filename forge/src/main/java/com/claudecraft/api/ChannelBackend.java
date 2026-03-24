@@ -4,10 +4,13 @@ import com.claudecraft.ClaudeCraft;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -240,6 +243,54 @@ public class ChannelBackend implements ClaudeBackend {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    public void connectGlobalSSE(StreamCallbacks callbacks) {
+        executor.submit(() -> {
+            try {
+                HttpRequest sseReq = HttpRequest.newBuilder()
+                        .uri(URI.create(getBaseUrl() + "/events"))
+                        .header("accept", "text/event-stream")
+                        .GET().build();
+                HttpResponse<java.io.InputStream> sseResp = httpClient.send(sseReq,
+                        HttpResponse.BodyHandlers.ofInputStream());
+                if (sseResp.statusCode() != 200) {
+                    ClaudeCraft.LOGGER.warn("Global SSE failed: HTTP {}", sseResp.statusCode());
+                    return;
+                }
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(sseResp.body(), StandardCharsets.UTF_8))) {
+                    StringBuilder dataBuilder = new StringBuilder();
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (line.startsWith("data: ")) {
+                            dataBuilder.append(line.substring(6));
+                        } else if (line.isEmpty() && dataBuilder.length() > 0) {
+                            String data = dataBuilder.toString().trim();
+                            dataBuilder.setLength(0);
+                            try {
+                                JsonObject event = JsonParser.parseString(data).getAsJsonObject();
+                                String type = event.has("type") ? event.get("type").getAsString() : "";
+                                switch (type) {
+                                    case "tool_call" -> callbacks.onToolExecRequest(
+                                            event.get("callId").getAsString(),
+                                            event.get("toolName").getAsString(),
+                                            event.get("input").getAsString());
+                                    case "reply" -> callbacks.onReply(event.get("text").getAsString());
+                                    case "done" -> callbacks.onComplete("end_turn", 0, 0);
+                                    case "error" -> callbacks.onError(event.has("message")
+                                            ? event.get("message").getAsString() : "Unknown channel error");
+                                }
+                            } catch (Exception e) {
+                                ClaudeCraft.LOGGER.debug("Skipping non-JSON global SSE data");
+                            }
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                ClaudeCraft.LOGGER.debug("Global SSE ended: {}", e.getMessage());
+            }
+        });
     }
 
     @Override
