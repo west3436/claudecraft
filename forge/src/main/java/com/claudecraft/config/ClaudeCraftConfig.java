@@ -12,6 +12,8 @@ public class ClaudeCraftConfig {
     public static final ForgeConfigSpec.IntValue REQUEST_TIMEOUT_SECONDS;
     public static final ForgeConfigSpec.ConfigValue<String> SYSTEM_PROMPT_PREFIX;
     public static final ForgeConfigSpec.BooleanValue ENABLE_WEB_ACCESS;
+    public static final ForgeConfigSpec.IntValue TOOL_TIMEOUT_SECONDS;
+    public static final ForgeConfigSpec.ConfigValue<String> PERSONALITY;
 
     static {
         var builder = new ForgeConfigSpec.Builder();
@@ -45,6 +47,14 @@ public class ClaudeCraftConfig {
         ENABLE_WEB_ACCESS = builder
                 .comment("Allow Claude to make HTTP requests using ComputerCraft's http API. Disabled by default for security.")
                 .define("enableWebAccess", false);
+
+        TOOL_TIMEOUT_SECONDS = builder
+                .comment("Default timeout in seconds for tool execution. Mining, pathfinding, and large builds may need more time.")
+                .defineInRange("toolTimeoutSeconds", 60, 10, 600);
+
+        PERSONALITY = builder
+                .comment("Personality prefix for the system prompt (e.g. 'You are a grumpy dwarf miner'). Empty for default behavior.")
+                .define("personality", "");
 
         builder.pop();
         SPEC = builder.build();

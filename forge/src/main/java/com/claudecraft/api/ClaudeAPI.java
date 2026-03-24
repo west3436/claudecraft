@@ -120,6 +120,23 @@ public class ClaudeAPI implements ILuaAPI {
     }
 
     /**
+     * Get the configured tool timeout in seconds.
+     */
+    @LuaFunction
+    public final int getToolTimeout() {
+        return ClaudeCraftConfig.TOOL_TIMEOUT_SECONDS.get();
+    }
+
+    /**
+     * Get the configured personality string for the system prompt.
+     */
+    @LuaFunction
+    public final String getPersonality() {
+        String p = ClaudeCraftConfig.PERSONALITY.get();
+        return p != null ? p : "";
+    }
+
+    /**
      * Start a Claude Code channel session for this computer.
      * Spawns a channel server and Claude Code process automatically.
      *

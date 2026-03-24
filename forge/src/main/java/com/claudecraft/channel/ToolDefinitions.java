@@ -29,7 +29,9 @@ public class ToolDefinitions {
             "get_info",
             "redstone",
             "peripheral_call",
-            "send_message"
+            "send_message",
+            "scan_area",
+            "automate_redstone"
     );
 
     /** Additional tools available only on turtles. */
