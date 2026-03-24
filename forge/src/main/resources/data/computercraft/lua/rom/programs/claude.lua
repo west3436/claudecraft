@@ -206,6 +206,7 @@ function tools.getDefs()
         {name="redstone", description="Redstone I/O.", input_schema={type="object",properties={action={type="string"},side={type="string"},value={type="number"}},required={"action","side"}}},
         {name="peripheral_call", description="Call peripheral method.", input_schema={type="object",properties={side={type="string"},method={type="string"},args={type="array",description="Arguments to pass"}},required={"side","method"}}},
         {name="get_recipes", description="Get Minecraft crafting/smelting/smithing recipes from the server. Returns all recipes, optionally filtered by output item name or recipe type.", input_schema={type="object",properties={item={type="string",description="Filter by output item (e.g. 'iron_pickaxe', 'diamond')"},type={type="string",description="Filter by recipe type (e.g. 'crafting', 'smelting', 'smithing')"}}}},
+        {name="scan_inventory", description="Scan a container's inventory (chest, barrel, shulker box, etc.) via peripheral. Returns all items with slot, name, and count. Use with get_recipes to plan crafting sequences — find available materials across nearby chests, then craft intermediate and final items.", input_schema={type="object",properties={peripheral={type="string",description="Peripheral name or side (e.g. 'minecraft:chest_0', 'left')"},detailed={type="boolean",description="If true, fetch full item details per slot including displayName, nbt, tags (slower). Default: false"}},required={"peripheral"}}},
     }
     if claude.isWebAccessEnabled() and http then
         d[#d+1] = {name="http_request", description="Make an HTTP request. Returns response body (max 64KB).", input_schema={type="object",properties={url={type="string",description="The URL to request"},method={type="string",description="HTTP method (GET/POST/PUT/DELETE/PATCH/HEAD/OPTIONS). Default: GET"},body={type="string",description="Request body (for POST/PUT/PATCH)"},headers={type="object",description="Request headers as key-value pairs"}},required={"url"}}}
@@ -217,6 +218,7 @@ function tools.getDefs()
         d[#d+1] = {name="turtle_inspect", description="Inspect: inspect/inspectUp/inspectDown/detect*.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inventory", description="Inventory: select/getItemDetail/refuel/drop/suck/etc.", input_schema={type="object",properties={action={type="string"},slot={type="number"},count={type="number"}},required={"action"}}}
         d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
+        d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
     return d
 end
@@ -504,6 +506,128 @@ function tools._exec(name, input)
             failed=#failed > 0 and failed or nil,
             missing=#missing > 0 and missing or nil
         }
+    elseif name == "turtle_goto" then
+        if not turtle then return {error="Not a turtle"} end
+        local tx, ty, tz = input.x, input.y, input.z
+        if not (tx and ty and tz) then return {error="x, y, z coordinates required"} end
+        tx, ty, tz = math.floor(tx), math.floor(ty), math.floor(tz)
+
+        -- Get current position via GPS
+        local cx, cy, cz = gps.locate(5)
+        if not cx then return {error="GPS failed - need 4+ GPS hosts in the world"} end
+        cx, cy, cz = math.floor(cx + 0.5), math.floor(cy + 0.5), math.floor(cz + 0.5)
+
+        -- Check fuel
+        local fuel = turtle.getFuelLevel()
+        if fuel ~= "unlimited" then
+            local dist = math.abs(tx - cx) + math.abs(ty - cy) + math.abs(tz - cz)
+            if fuel < dist then
+                return {error="Not enough fuel. Need ~"..dist..", have "..fuel}
+            end
+        end
+
+        -- Facing: 0=south(+z), 1=west(-x), 2=north(-z), 3=east(+x)
+        local facing = nil
+
+        local function detectFacing()
+            local sx, sz = cx, cz
+            -- Try to move forward to detect facing
+            local moved = turtle.forward()
+            if not moved then turtle.dig(); moved = turtle.forward() end
+            if not moved then return false end
+            local nx, ny, nz = gps.locate(5)
+            if not nx then turtle.back(); return false end
+            nx, nz = math.floor(nx + 0.5), math.floor(nz + 0.5)
+            local dx, dz = nx - sx, nz - sz
+            if dz == 1 then facing = 0
+            elseif dx == -1 then facing = 1
+            elseif dz == -1 then facing = 2
+            elseif dx == 1 then facing = 3
+            else turtle.back(); return false end
+            cx, cy, cz = nx, math.floor(ny + 0.5), nz
+            return true
+        end
+
+        local function turnTo(dir)
+            if facing == dir then return end
+            local diff = (dir - facing) % 4
+            if diff == 1 then turtle.turnRight()
+            elseif diff == 2 then turtle.turnRight(); turtle.turnRight()
+            elseif diff == 3 then turtle.turnLeft() end
+            facing = dir
+        end
+
+        local function tryForward()
+            if turtle.forward() then return true end
+            turtle.dig(); if turtle.forward() then return true end
+            -- Entity might be blocking, attack and retry
+            turtle.attack(); return turtle.forward()
+        end
+
+        local function tryUp()
+            if turtle.up() then return true end
+            turtle.digUp(); if turtle.up() then return true end
+            turtle.attackUp(); return turtle.up()
+        end
+
+        local function tryDown()
+            if turtle.down() then return true end
+            turtle.digDown(); if turtle.down() then return true end
+            turtle.attackDown(); return turtle.down()
+        end
+
+        if not detectFacing() then
+            return {error="Could not determine facing direction (blocked on all sides?)"}
+        end
+
+        -- Already there?
+        if cx == tx and cy == ty and cz == tz then
+            return {success=true, position={x=cx, y=cy, z=cz}, steps=0}
+        end
+
+        local steps = 0
+        local maxSteps = math.abs(tx - cx) + math.abs(ty - cy) + math.abs(tz - cz) + 50
+        local stuck = false
+
+        -- Move Y first (safest, avoids terrain)
+        while cy ~= ty and steps < maxSteps and not stuck do
+            steps = steps + 1
+            if ty > cy then
+                if tryUp() then cy = cy + 1 else stuck = true end
+            else
+                if tryDown() then cy = cy - 1 else stuck = true end
+            end
+        end
+
+        -- Move X
+        while cx ~= tx and steps < maxSteps and not stuck do
+            steps = steps + 1
+            if tx > cx then turnTo(3) else turnTo(1) end
+            if tryForward() then
+                cx = cx + (tx > cx and 1 or -1)
+            else stuck = true end
+        end
+
+        -- Move Z
+        while cz ~= tz and steps < maxSteps and not stuck do
+            steps = steps + 1
+            if tz > cz then turnTo(0) else turnTo(2) end
+            if tryForward() then
+                cz = cz + (tz > cz and 1 or -1)
+            else stuck = true end
+        end
+
+        local arrived = cx == tx and cy == ty and cz == tz
+        local result = {
+            success=arrived,
+            position={x=cx, y=cy, z=cz},
+            target={x=tx, y=ty, z=tz},
+            steps=steps,
+            fuelRemaining=turtle.getFuelLevel()
+        }
+        if stuck then result.stuck=true end
+        if steps >= maxSteps then result.error="Exceeded max steps" end
+        return result
     elseif name == "http_request" then
         if not claude.isWebAccessEnabled() then return {error="Web access is disabled in server config"} end
         if not http then return {error="HTTP API not available"} end
@@ -538,6 +662,29 @@ function tools._exec(name, input)
         response.close()
         if body and #body > 65536 then body = body:sub(1, 65536) .. "\n...(truncated at 64KB)" end
         return {status=code, headers=respHeaders, body=body}
+    elseif name == "scan_inventory" then
+        local pName = input.peripheral
+        if not peripheral.isPresent(pName) then return {error="No peripheral: "..pName} end
+        local inv = peripheral.wrap(pName)
+        if not inv or not inv.list then return {error="Not an inventory peripheral: "..pName} end
+        local items = inv.list()
+        local size = inv.size and inv.size() or 0
+        local result = {slots={}, size=size, peripheral=pName}
+        for slot, item in pairs(items) do
+            if input.detailed and inv.getItemDetail then
+                local detail = inv.getItemDetail(slot)
+                if detail then
+                    result.slots[#result.slots+1] = {slot=slot, name=detail.name, count=detail.count, displayName=detail.displayName, nbt=detail.nbt, tags=detail.tags}
+                else
+                    result.slots[#result.slots+1] = {slot=slot, name=item.name, count=item.count}
+                end
+            else
+                result.slots[#result.slots+1] = {slot=slot, name=item.name, count=item.count}
+            end
+        end
+        table.sort(result.slots, function(a,b) return a.slot < b.slot end)
+        result.itemCount = #result.slots
+        return result
     elseif name == "get_recipes" then
         local json = claude.getRecipes(input.item, input.type)
         local ok2, data = pcall(textutils.unserialiseJSON, json)
@@ -698,7 +845,7 @@ local model = claude.getModel()
 local sysPr = string.format(
     "You are Claude Code, an AI assistant inside a ComputerCraft computer in Minecraft. " ..
     "ID: %d. Label: %s. Terminal: %dx%d. %s" ..
-    "You have tools for files, search, shell, %s%sredstone, peripherals, and Minecraft recipes.\n" ..
+    "You have tools for files, search, shell, %s%sredstone, peripherals, inventory scanning, and Minecraft recipes.\n" ..
     "Be VERY concise (tiny terminal). Use tools proactively. Write idiomatic CC:Tweaked Lua.\n" ..
     "NEVER use emojis - the terminal cannot display them (they show as ?). " ..
     "NEVER use markdown formatting (no **, no ##, no ```) - this is a plain text terminal, not a markdown renderer. " ..
@@ -970,6 +1117,27 @@ local function main()
     term.clear(); term.setCursorPos(1,1); print("Session ended.")
 end
 
+local function incomingMessageHandler()
+    while true do
+        local ev, p1, p2, p3, p4 = os.pullEvent()
+        if ev == "claude_tool_exec" and p1 == "incoming" then
+            local input = {}
+            if p4 then
+                local ok2, parsed = pcall(textutils.unserialiseJSON, p4)
+                if ok2 and parsed then input = parsed end
+            end
+            showToolCall(p3, input)
+            local r = tools.exec(p3, input)
+            showToolResult(p3, r)
+            claude.sendToolResult(p1, p2, textutils.serialiseJSON(r))
+        elseif ev == "claude_text" and p1 == "incoming" then
+            ui.add(p2, C.ai); ui.blank(); ui.drawBody()
+        elseif ev == "claude_done" and p1 == "incoming" then
+            ui.drawBody(); ui.drawInput()
+        end
+    end
+end
+
 parallel.waitForAny(main, function()
     while true do
         local ev, p1 = os.pullEvent()
@@ -983,4 +1151,4 @@ parallel.waitForAny(main, function()
             if monitor then ui.drawMonitor() end
         end
     end
-end)
+end, incomingMessageHandler)
