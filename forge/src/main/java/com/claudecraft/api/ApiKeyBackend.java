@@ -93,28 +93,48 @@ public class ApiKeyBackend implements ClaudeBackend {
         executor.submit(() -> {
             handle.setRequestThread(Thread.currentThread());
             try {
-                HttpResponse<java.io.InputStream> response = httpClient.send(
-                        request, HttpResponse.BodyHandlers.ofInputStream());
+                int maxRetries = 2;
+                int attempt = 0;
+                while (true) {
+                    if (handle.isCancelled()) return;
 
-                if (response.statusCode() != 200) {
-                    String errorBody = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
-                    String msg = "HTTP " + response.statusCode();
-                    try {
-                        JsonObject err = JsonParser.parseString(errorBody).getAsJsonObject();
-                        if (err.has("error")) {
-                            JsonObject errObj = err.getAsJsonObject("error");
-                            if (errObj.has("message")) {
-                                msg = errObj.get("message").getAsString();
-                            }
-                        }
-                    } catch (Exception ignored) {
-                        if (errorBody.length() < 300) msg = errorBody;
+                    HttpResponse<java.io.InputStream> response = httpClient.send(
+                            request, HttpResponse.BodyHandlers.ofInputStream());
+
+                    int statusCode = response.statusCode();
+
+                    // Retry on 429 (rate limit) or 5xx (server error) with exponential backoff
+                    if ((statusCode == 429 || statusCode >= 500) && attempt < maxRetries) {
+                        response.body().close();
+                        attempt++;
+                        long backoffMs = 1000L * (1L << (attempt - 1)); // 1s, 2s
+                        ClaudeCraft.LOGGER.warn("HTTP {} from API, retrying in {}ms (attempt {}/{})",
+                                statusCode, backoffMs, attempt, maxRetries);
+                        Thread.sleep(backoffMs);
+                        continue;
                     }
-                    callbacks.onError(msg);
+
+                    if (statusCode != 200) {
+                        String errorBody = new String(response.body().readAllBytes(), StandardCharsets.UTF_8);
+                        String msg = "HTTP " + statusCode;
+                        try {
+                            JsonObject err = JsonParser.parseString(errorBody).getAsJsonObject();
+                            if (err.has("error")) {
+                                JsonObject errObj = err.getAsJsonObject("error");
+                                if (errObj.has("message")) {
+                                    msg = errObj.get("message").getAsString();
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            if (errorBody.length() < 300) msg = errorBody;
+                        }
+                        callbacks.onError(msg);
+                        return;
+                    }
+
+                    parseSSEStream(response.body(), handle, callbacks);
                     return;
                 }
-
-                parseSSEStream(response.body(), handle, callbacks);
 
             } catch (InterruptedException e) {
                 if (!handle.isCancelled()) {
