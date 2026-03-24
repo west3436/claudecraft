@@ -837,6 +837,34 @@ local function main()
     term.clear(); term.setCursorPos(1,1); print("Session ended.")
 end
 
+-- Background handler for incoming inter-computer messages (channel mode only).
+local function incomingMessageHandler()
+    while true do
+        local ev, p1, p2, p3, p4 = os.pullEvent()
+
+        if ev == "claude_tool_exec" and p1 == "incoming" then
+            local input = {}
+            if p4 then
+                local ok2, parsed = pcall(textutils.unserialiseJSON, p4)
+                if ok2 and parsed then input = parsed end
+            end
+            showToolCall(p3, input)
+            local r = tools.exec(p3, input)
+            showToolResult(p3, r)
+            claude.sendToolResult(p1, p2, textutils.serialiseJSON(r))
+
+        elseif ev == "claude_text" and p1 == "incoming" then
+            ui.add(p2, C.ai)
+            ui.blank()
+            ui.drawBody()
+
+        elseif ev == "claude_done" and p1 == "incoming" then
+            ui.drawBody()
+            ui.drawInput()
+        end
+    end
+end
+
 parallel.waitForAny(main, function()
     while true do
         local ev, p1 = os.pullEvent()
@@ -850,4 +878,4 @@ parallel.waitForAny(main, function()
             if monitor then ui.drawMonitor() end
         end
     end
-end)
+end, incomingMessageHandler)
