@@ -47,6 +47,7 @@ const COMPUTER_LABEL = getArg("label", "Computer");
 const IS_TURTLE = hasFlag("turtle");
 const TERM_WIDTH = parseInt(getArg("term-width", "51"), 10);
 const TERM_HEIGHT = parseInt(getArg("term-height", "19"), 10);
+const TOOL_TIMEOUT = parseInt(getArg("tool-timeout", "60"), 10) * 1000;
 
 // Registry file for inter-computer messaging (written by the Java mod)
 const REGISTRY_PATH = (() => {
@@ -402,9 +403,45 @@ const TURTLE_TOOLS: ToolDef[] = [
   },
 ];
 
+const WORLD_TOOLS: ToolDef[] = [
+  {
+    name: "scan_area",
+    description:
+      "Scan the surrounding area for blocks. Uses a block scanner peripheral if available, " +
+      "otherwise uses turtle inspect on all 6 sides. Returns block data for spatial awareness.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        radius: {
+          type: "number",
+          description:
+            "Scan radius (default 1). Only used with block scanner peripheral.",
+        },
+      },
+    },
+  },
+  {
+    name: "automate_redstone",
+    description:
+      "Gather redstone state from all sides and nearby peripherals to help design a redstone circuit. " +
+      "Describe what you want (e.g. 'turn on the lamp when it gets dark') and this tool returns " +
+      "current redstone state and peripheral info so you can plan and deploy the circuit using the redstone tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        description: {
+          type: "string",
+          description: "Natural language description of the desired redstone behavior",
+        },
+      },
+      required: ["description"],
+    },
+  },
+];
+
 const ALL_TOOLS = IS_TURTLE
-  ? [...STANDARD_TOOLS, ...TURTLE_TOOLS]
-  : STANDARD_TOOLS;
+  ? [...STANDARD_TOOLS, ...TURTLE_TOOLS, ...WORLD_TOOLS]
+  : [...STANDARD_TOOLS, ...WORLD_TOOLS];
 
 // ---------------------------------------------------------------------------
 // MCP Server
@@ -536,7 +573,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   // Wait for the mod to POST the result
   // build_structure can take several minutes for large blueprints; turtle_goto may travel long distances
-  const timeoutMs = name === "build_structure" ? 600_000 : name === "turtle_goto" ? 300_000 : 60_000;
+  const timeoutMs = name === "build_structure" ? 600_000 : name === "turtle_goto" ? 300_000 : TOOL_TIMEOUT;
   const result = await new Promise<string>((resolve) => {
     pendingToolCalls.set(callId, { resolve });
 
