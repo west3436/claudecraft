@@ -321,6 +321,42 @@ const TURTLE_TOOLS: ToolDef[] = [
       required: ["action"],
     },
   },
+  {
+    name: "build_structure",
+    description:
+      "Execute a multi-block build from a blueprint. Provide blocks as relative coordinates from the turtle's current position. The turtle navigates to each position, selects the matching block from inventory, and places it. Builds bottom-up layer by layer. Block names must match inventory item names (e.g. 'minecraft:oak_planks'). The turtle must have the required blocks in its inventory before calling this tool.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        blocks: {
+          type: "array",
+          description:
+            "Array of block placements relative to turtle's starting position.",
+          items: {
+            type: "object",
+            properties: {
+              x: { type: "number", description: "X offset (right of turtle)" },
+              y: {
+                type: "number",
+                description: "Y offset (up from turtle, 0 = turtle level - 1)",
+              },
+              z: {
+                type: "number",
+                description: "Z offset (forward from turtle)",
+              },
+              block: {
+                type: "string",
+                description:
+                  "Minecraft block ID matching inventory item (e.g. 'minecraft:oak_planks')",
+              },
+            },
+            required: ["x", "y", "z", "block"],
+          },
+        },
+      },
+      required: ["blocks"],
+    },
+  },
 ];
 
 const ALL_TOOLS = IS_TURTLE
@@ -425,16 +461,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   );
 
   // Wait for the mod to POST the result
+  // build_structure can take several minutes for large blueprints
+  const timeoutMs = name === "build_structure" ? 600_000 : 60_000;
   const result = await new Promise<string>((resolve) => {
     pendingToolCalls.set(callId, { resolve });
 
-    // Timeout after 60 seconds
     setTimeout(() => {
       if (pendingToolCalls.has(callId)) {
         pendingToolCalls.delete(callId);
         resolve(JSON.stringify({ error: "Tool execution timed out" }));
       }
-    }, 60_000);
+    }, timeoutMs);
   });
 
   return { content: [{ type: "text" as const, text: result }] };
