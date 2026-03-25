@@ -475,6 +475,7 @@ let requestCounter = 0;
 Bun.serve({
   port: PORT,
   hostname: "127.0.0.1",
+  idleTimeout: 0, // Disable idle timeout — SSE connections are long-lived
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -627,7 +628,8 @@ Bun.serve({
   },
 });
 
-// Heartbeat: send keepalive events every 15s to prevent idle connection drops
+// Heartbeat: send keepalive events every 5s to prevent idle connection drops.
+// Kept short to survive any intermediary timeouts while Claude is thinking.
 setInterval(() => {
   const heartbeat = `data: ${JSON.stringify({ type: "heartbeat" })}\n\n`;
   const bytes = new TextEncoder().encode(heartbeat);
@@ -647,7 +649,7 @@ setInterval(() => {
       globalSSE = null;
     }
   }
-}, 15_000);
+}, 5_000);
 
 // Log to stderr (stdout is reserved for MCP stdio transport)
 console.error(
