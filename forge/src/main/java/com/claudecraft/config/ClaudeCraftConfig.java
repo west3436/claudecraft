@@ -1,22 +1,22 @@
 package com.claudecraft.config;
 
-import net.minecraftforge.common.ForgeConfigSpec;
+import net.neoforged.neoforge.common.ModConfigSpec;
 
 public class ClaudeCraftConfig {
-    public static final ForgeConfigSpec SPEC;
+    public static final ModConfigSpec SPEC;
 
-    public static final ForgeConfigSpec.ConfigValue<String> API_KEY;
-    public static final ForgeConfigSpec.ConfigValue<String> MODEL;
-    public static final ForgeConfigSpec.IntValue MAX_TOKENS;
-    public static final ForgeConfigSpec.IntValue MAX_CONCURRENT_REQUESTS;
-    public static final ForgeConfigSpec.IntValue REQUEST_TIMEOUT_SECONDS;
-    public static final ForgeConfigSpec.ConfigValue<String> SYSTEM_PROMPT_PREFIX;
-    public static final ForgeConfigSpec.BooleanValue ENABLE_WEB_ACCESS;
-    public static final ForgeConfigSpec.IntValue TOOL_TIMEOUT_SECONDS;
-    public static final ForgeConfigSpec.ConfigValue<String> PERSONALITY;
+    public static final ModConfigSpec.ConfigValue<String> API_KEY;
+    public static final ModConfigSpec.ConfigValue<String> MODEL;
+    public static final ModConfigSpec.IntValue MAX_TOKENS;
+    public static final ModConfigSpec.IntValue MAX_CONCURRENT_REQUESTS;
+    public static final ModConfigSpec.IntValue REQUEST_TIMEOUT_SECONDS;
+    public static final ModConfigSpec.ConfigValue<String> SYSTEM_PROMPT_PREFIX;
+    public static final ModConfigSpec.BooleanValue ENABLE_WEB_ACCESS;
+    public static final ModConfigSpec.IntValue TOOL_TIMEOUT_SECONDS;
+    public static final ModConfigSpec.ConfigValue<String> PERSONALITY;
 
     static {
-        var builder = new ForgeConfigSpec.Builder();
+        var builder = new ModConfigSpec.Builder();
 
         builder.comment("ClaudeCraft Configuration").push("api");
 

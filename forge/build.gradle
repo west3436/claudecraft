@@ -1,50 +1,54 @@
 plugins {
-    id 'eclipse'
+    id 'java-library'
     id 'idea'
     id 'maven-publish'
-    id 'net.minecraftforge.gradle' version '[6.0.26,6.1)'
+    id 'net.neoforged.moddev' version '2.0.141'
 }
 
-version = '1.2.1'
+version = '1.2.2'
 group = 'com.claudecraft'
-archivesBaseName = 'claudecraft'
 
-java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+base {
+    archivesName = 'claudecraft'
+}
 
-minecraft {
-    mappings channel: 'official', version: '1.21.1'
-
-    runs {
-        configureEach {
-            workingDirectory project.file('run')
-            property 'forge.logging.markers', 'REGISTRIES'
-            property 'forge.logging.console.level', 'debug'
-            mods {
-                claudecraft {
-                    source sourceSets.main
-                }
-            }
-        }
-
-        client {}
-        server {}
-    }
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
 }
 
 repositories {
+    mavenCentral()
     maven {
-        url "https://maven.squiddev.cc"
+        url = "https://maven.squiddev.cc"
         content {
             includeGroup("cc.tweaked")
         }
     }
-    mavenCentral()
+}
+
+neoForge {
+    version = "21.1.234"
+
+    runs {
+        client {
+            client()
+        }
+        server {
+            server()
+        }
+    }
+
+    mods {
+        claudecraft {
+            sourceSet sourceSets.main
+        }
+    }
 }
 
 dependencies {
-    minecraft 'net.minecraftforge:forge:1.21.1-52.1.0'
-
-    // CC: Tweaked API
+    // CC: Tweaked API. For Minecraft 1.21.1 the "forge" artifacts are built
+    // for NeoForge (their jars ship META-INF/neoforge.mods.toml), so these are
+    // the correct coordinates for a NeoForge mod.
     compileOnly "cc.tweaked:cc-tweaked-1.21.1-forge-api:1.117.1"
     compileOnly "cc.tweaked:cc-tweaked-1.21.1-core-api:1.117.1"
     runtimeOnly "cc.tweaked:cc-tweaked-1.21.1-forge:1.117.1"
@@ -66,5 +70,3 @@ jar {
         ])
     }
 }
-
-// reobfJar not needed with ForgeGradle 6

@@ -1,5 +1,5 @@
 modLoader = "javafml"
-loaderVersion = "[52,)"
+loaderVersion = "[1,)"
 license = "MIT"
 
 [[mods]]
@@ -13,22 +13,22 @@ Adds a built-in 'claude' API to all CC: Tweaked computers with streaming support
 authors = "ClaudeCraft"
 
 [[dependencies.claudecraft]]
-modId = "forge"
-mandatory = true
-versionRange = "[52,)"
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1.0,)"
 ordering = "NONE"
 side = "BOTH"
 
 [[dependencies.claudecraft]]
 modId = "minecraft"
-mandatory = true
+type = "required"
 versionRange = "[1.21.1,1.22)"
 ordering = "NONE"
 side = "BOTH"
 
 [[dependencies.claudecraft]]
 modId = "computercraft"
-mandatory = true
-versionRange = "[1.101.0,)"
+type = "required"
+versionRange = "[1.117.0,)"
 ordering = "AFTER"
 side = "BOTH"
