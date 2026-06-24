@@ -1,13 +1,13 @@
 # ClaudeCraft
 
-A Minecraft Forge mod that brings Claude AI into [CC: Tweaked](https://tweaked.cc/) computers and turtles.
+A Minecraft NeoForge mod that brings Claude AI into [CC: Tweaked](https://tweaked.cc/) computers and turtles.
 
 Players interact with Claude through an in-game terminal — ask questions, run tools, automate tasks, and control turtles using natural language.
 
 ## Requirements
 
 - Minecraft 1.21.1
-- Minecraft Forge 52.1.0+
+- NeoForge 21.1.0+
 - [CC: Tweaked](https://modrinth.com/mod/cc-tweaked) 1.117.1+
 - **One** of the following:
   - An [Anthropic API key](https://console.anthropic.com/) (API Key mode), **or**
@@ -15,7 +15,7 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 
 ## Installation
 
-1. Install Minecraft Forge and CC: Tweaked.
+1. Install NeoForge and CC: Tweaked.
 2. Drop the ClaudeCraft `.jar` into your `mods/` folder.
 3. Open any CC: Tweaked computer or turtle and run:
    ```

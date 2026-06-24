@@ -11,8 +11,8 @@ import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.*;
-import net.minecraftforge.registries.ForgeRegistries;
-import net.minecraftforge.server.ServerLifecycleHooks;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.neoforged.neoforge.server.ServerLifecycleHooks;
 import org.jetbrains.annotations.NotNull;
 
 import java.util.*;
@@ -307,13 +307,13 @@ public class ClaudeAPI implements ILuaAPI {
         for (RecipeHolder<?> holder : recipeManager.getRecipes()) {
             Recipe<?> recipe = holder.value();
 
-            ResourceLocation typeId = ForgeRegistries.RECIPE_TYPES.getKey(recipe.getType());
+            ResourceLocation typeId = BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType());
             String typeStr = typeId != null ? typeId.toString() : "unknown";
 
             if (typeFilter != null && !typeStr.contains(typeFilter)) continue;
 
             ItemStack result = recipe.getResultItem(registryAccess);
-            ResourceLocation resultId = ForgeRegistries.ITEMS.getKey(result.getItem());
+            ResourceLocation resultId = BuiltInRegistries.ITEM.getKey(result.getItem());
             String resultName = resultId != null ? resultId.toString() : "unknown";
 
             if (itemFilter != null && !resultName.contains(itemFilter)) continue;
@@ -329,7 +329,7 @@ public class ClaudeAPI implements ILuaAPI {
                 if (ingredient.isEmpty()) continue;
                 JsonArray items = new JsonArray();
                 for (ItemStack item : ingredient.getItems()) {
-                    ResourceLocation itemId = ForgeRegistries.ITEMS.getKey(item.getItem());
+                    ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(item.getItem());
                     if (itemId != null) items.add(itemId.toString());
                 }
                 if (items.size() > 0) ingredients.add(items);
