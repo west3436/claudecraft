@@ -5,10 +5,8 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.Collection;
 import java.util.List;
 import java.util.TreeSet;
@@ -16,10 +14,11 @@ import java.util.TreeSet;
 /**
  * Which computers may send inter-computer messages to a computer (default: none).
  *
- * <p>Stored on the host in {@code ~/.claudecraft/computers/<id>/message-allowlist.json},
- * outside the CC:Tweaked file system, so Claude's file tools cannot edit it. The
- * receiving computer's channel server reads this file for every incoming message,
- * so changes take effect immediately and survive restarts.
+ * <p>Stored on the host in the computer's sandbox,
+ * {@code ~/.claudecraft/worlds/<world>/computers/<id>/message-allowlist.json},
+ * outside the CC:Tweaked file system, so Claude's file tools cannot edit it.
+ * The channel server gets the path with {@code --allowlist} and reads the file for
+ * every incoming message, so changes take effect immediately and survive restarts.
  *
  * <p>Format: {@code {"allowedComputerIds": [3, 7]}}. Keep in sync with
  * {@code loadAllowlist()} in claudecraft-channel.ts.
@@ -31,16 +30,11 @@ public final class MessageAllowlist {
 
     private MessageAllowlist() {}
 
-    private static Path file(int computerId) {
-        return Path.of(System.getProperty("user.home"),
-                ".claudecraft", "computers", String.valueOf(computerId), FILE_NAME);
-    }
-
-    /** The computer IDs allowed to message {@code computerId}, sorted. Empty if none. */
-    public static synchronized List<Integer> get(int computerId) {
-        TreeSet<Integer> ids = new TreeSet<>();
-        Path path = file(computerId);
+    /** The computer IDs allowed to message the computer owning {@code sandboxDir}, sorted. */
+    public static synchronized List<Integer> get(Path sandboxDir) {
+        Path path = sandboxDir.resolve(FILE_NAME);
         if (!Files.exists(path)) return List.of();
+        TreeSet<Integer> ids = new TreeSet<>();
         try {
             JsonElement root = JsonParser.parseString(Files.readString(path));
             if (root.isJsonObject() && root.getAsJsonObject().has(KEY)
@@ -61,8 +55,8 @@ public final class MessageAllowlist {
         return List.copyOf(ids);
     }
 
-    /** Replace the allowlist for {@code computerId}. Returns the stored, sorted list. */
-    public static synchronized List<Integer> set(int computerId, Collection<Integer> ids)
+    /** Replace the allowlist in {@code sandboxDir}. Returns the stored, sorted list. */
+    public static synchronized List<Integer> set(Path sandboxDir, Collection<Integer> ids)
             throws Exception {
         TreeSet<Integer> sorted = new TreeSet<>(ids);
         if (sorted.size() > MAX_ENTRIES) {
@@ -74,16 +68,8 @@ public final class MessageAllowlist {
         JsonObject root = new JsonObject();
         root.add(KEY, arr);
 
-        Path target = file(computerId);
-        Files.createDirectories(target.getParent());
-        Path tmp = target.resolveSibling(FILE_NAME + ".tmp");
-        Files.writeString(tmp, root.toString());
-        try {
-            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,
-                    StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException e) {
-            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-        }
+        Files.createDirectories(sandboxDir);
+        ChannelProcessManager.writeAtomically(sandboxDir.resolve(FILE_NAME), root.toString());
         return List.copyOf(sorted);
     }
 }

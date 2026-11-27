@@ -56,8 +56,11 @@ const IS_TURTLE = hasFlag("turtle");
 const TERM_WIDTH = parseInt(getArg("term-width", "51"), 10);
 const TERM_HEIGHT = parseInt(getArg("term-height", "19"), 10);
 
-// Registry file for inter-computer messaging (written by the Java mod)
+// Registry file for inter-computer messaging (written by the Java mod).
+// The mod passes --registry: each world has its own registry.
 const REGISTRY_PATH = (() => {
+  const explicit = getArg("registry", "");
+  if (explicit) return explicit;
   const home =
     process.env.USERPROFILE || process.env.HOME || ".";
   return `${home}/.claudecraft/channel-registry.json`;
@@ -165,11 +168,12 @@ const MAX_MESSAGE_CHARS = 4000;
 const RATE_LIMIT_MAX = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
-/** Written by the mod (MessageAllowlist.java). Missing or unreadable = deny all. */
-const ALLOWLIST_PATH = (() => {
-  const home = process.env.USERPROFILE || process.env.HOME || ".";
-  return `${home}/.claudecraft/computers/${COMPUTER_ID}/message-allowlist.json`;
-})();
+/**
+ * This computer's message allowlist in its per-world sandbox, written by the mod
+ * (MessageAllowlist.java) and passed with --allowlist. No path, a missing file or
+ * an unreadable file all mean deny all.
+ */
+const ALLOWLIST_PATH = getArg("allowlist", "");
 
 /** Constant-time string comparison (hashing first hides length differences). */
 function safeEqual(a: string, b: string): boolean {
@@ -237,6 +241,7 @@ async function readJsonBody(req: Request): Promise<Record<string, unknown> | nul
 
 /** Computer IDs allowed to message this computer (set in-game with /allow). */
 async function loadAllowlist(): Promise<Set<string>> {
+  if (!ALLOWLIST_PATH) return new Set();
   try {
     const data = JSON.parse(await Bun.file(ALLOWLIST_PATH).text()) as {
       allowedComputerIds?: unknown;
