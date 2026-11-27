@@ -35,11 +35,63 @@ end
 ----------------------------------------------------------------------
 -- TOKEN & COST TRACKING
 ----------------------------------------------------------------------
-local stats = {totalIn=0, totalOut=0, requests=0}
+-- Per-model prices live in /rom/modules/main/claudecraft/pricing.lua.
+local pricing = require("claudecraft.pricing")
 
-local function estimateCost(inp, out)
-    -- Approximate costs per million tokens (Sonnet-class pricing)
-    return (inp * 3.0 / 1000000) + (out * 15.0 / 1000000)
+-- totalIn is uncached input only; total prompt = totalIn + cacheWrite + cacheRead.
+local stats = {totalIn=0, totalOut=0, cacheWrite=0, cacheRead=0, requests=0, cost=0, uncachedCost=0}
+
+-- Record one API response's usage. Cost is priced per request (some models are
+-- tiered by prompt length). Returns that request's cost.
+function stats.record(inp, out, cw, cr)
+    inp, out, cw, cr = inp or 0, out or 0, cw or 0, cr or 0
+    stats.requests = stats.requests + 1
+    stats.totalIn = stats.totalIn + inp
+    stats.totalOut = stats.totalOut + out
+    stats.cacheWrite = stats.cacheWrite + cw
+    stats.cacheRead = stats.cacheRead + cr
+    local cost, uncached = pricing.requestCost(claude.getModel(), inp, out, cw, cr)
+    stats.cost = stats.cost + cost
+    stats.uncachedCost = stats.uncachedCost + uncached
+    return cost
+end
+
+-- One-line usage summary for a response, e.g. "(5242 in [4810 cached, 120 new] / 85 out)".
+-- "cached" is cache_read_input_tokens; it should be > 0 from the second agent round on.
+function stats.usageLine(inp, out, cw, cr)
+    inp, out, cw, cr = inp or 0, out or 0, cw or 0, cr or 0
+    local f = pricing.fmtTokens
+    local parts = {}
+    if cr > 0 then parts[#parts+1] = f(cr).." cached" end
+    if cw > 0 then parts[#parts+1] = f(cw).." new" end
+    local cache = #parts > 0 and (" ["..table.concat(parts, ", ").."]") or ""
+    return string.format("(%s in%s / %s out)", f(inp + cw + cr), cache, f(out))
+end
+
+-- Lines for the /stats command.
+function stats.report()
+    local f = pricing.fmtTokens
+    local model = claude.getModel()
+    local r = pricing.lookup(model)
+    local prompt = stats.totalIn + stats.cacheWrite + stats.cacheRead
+    local hit = prompt > 0 and math.floor(stats.cacheRead * 100 / prompt + 0.5) or 0
+    local L = {
+        "  Model: "..model,
+        string.format("  Requests:    %d", stats.requests),
+        string.format("  Input:       %s (%s uncached)", f(prompt), f(stats.totalIn)),
+        string.format("  Cache read:  %s (%d%% of input)", f(stats.cacheRead), hit),
+        string.format("  Cache write: %s", f(stats.cacheWrite)),
+        string.format("  Output:      %s", f(stats.totalOut)),
+        string.format("  Est. cost:   $%.4f", stats.cost),
+    }
+    if stats.uncachedCost > stats.cost then
+        L[#L+1] = string.format("  Cache saved: $%.4f", stats.uncachedCost - stats.cost)
+    end
+    local fr = pricing.fmtRate
+    L[#L+1] = string.format("  $/MTok in %s out %s, cache w %s r %s",
+        fr(r.input), fr(r.output), fr(r.write), fr(r.read))
+    if not r.exact then L[#L+1] = "  (unknown model, priced as "..r.id..")" end
+    return L
 end
 
 ----------------------------------------------------------------------
@@ -73,6 +125,7 @@ function progress.track(toolName, result)
     elseif toolName == "run_command" then p.commands_run = (p.commands_run or 0) + 1
     elseif toolName == "turtle_move" and result and result.results then p.moves = (p.moves or 0) + (result.completed or 0)
     elseif toolName == "turtle_goto" and result and result.success then p.moves = (p.moves or 0) + (result.steps or 0)
+    elseif toolName == "turtle_craft" and result and result.crafted then p.items_crafted = (p.items_crafted or 0) + result.crafted
     end
     progress.save(p)
 end
@@ -235,6 +288,13 @@ end
 -- TOOLS (same as standalone, executed Lua-side)
 ----------------------------------------------------------------------
 local tools = {}
+local guard = require("claudecraft.guard") -- confirm mode + hard limits for destructive tools
+
+-- Item logistics tools (find_item, move_items, sort_storage, fluid_tanks,
+-- turtle_craft, turtle_equip): /rom/modules/main/claudecraft/logistics.lua
+local okLogistics, logistics = pcall(require, "claudecraft.logistics")
+local logisticsErr
+if not okLogistics then logisticsErr, logistics = logistics, nil end
 
 function tools.getDefs()
     local d = {
@@ -250,7 +310,7 @@ function tools.getDefs()
         {name="get_info", description="System info: ID, fuel, peripherals.", input_schema={type="object",properties={}}},
         {name="redstone", description="Redstone I/O.", input_schema={type="object",properties={action={type="string"},side={type="string"},value={type="number"}},required={"action","side"}}},
         {name="peripheral_call", description="Call peripheral method.", input_schema={type="object",properties={side={type="string"},method={type="string"},args={type="array",description="Arguments to pass"}},required={"side","method"}}},
-        {name="get_recipes", description="Get Minecraft crafting/smelting/smithing recipes from the server. Returns all recipes, optionally filtered by output item name or recipe type.", input_schema={type="object",properties={item={type="string",description="Filter by output item (e.g. 'iron_pickaxe', 'diamond')"},type={type="string",description="Filter by recipe type (e.g. 'crafting', 'smelting', 'smithing')"}}}},
+        {name="get_recipes", description="Look up Minecraft recipes (crafting/smelting/smithing...) on the server. Needs an item or type filter. Exact output matches come first; results are capped. Shaped recipes have width, height and grid (row-major, 0 = empty, else 1-based index into ingredients). To craft on a turtle, use turtle_craft.", input_schema={type="object",properties={item={type="string",description="Output item (e.g. 'iron_pickaxe', 'minecraft:torch')"},type={type="string",description="Recipe type (e.g. 'crafting', 'smelting', 'smithing')"},limit={type="number",description="Max recipes (default 10, max 50)"}}}},
         {name="scan_inventory", description="Scan a container's inventory (chest, barrel, shulker box, etc.) via peripheral. Returns all items with slot, name, and count. Use with get_recipes to plan crafting sequences — find available materials across nearby chests, then craft intermediate and final items.", input_schema={type="object",properties={peripheral={type="string",description="Peripheral name or side (e.g. 'minecraft:chest_0', 'left')"},detailed={type="boolean",description="If true, fetch full item details per slot including displayName, nbt, tags (slower). Default: false"}},required={"peripheral"}}},
     }
     d[#d+1] = {name="scan_area", description="Scan surrounding area for blocks. Uses block scanner peripheral if available, otherwise turtle inspect on all 6 sides.", input_schema={type="object",properties={radius={type="number",description="Scan radius (default 1). Only used with block scanner peripheral."}}}}
@@ -267,17 +327,20 @@ function tools.getDefs()
         d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
+    if logistics then for _, def in ipairs(logistics.getDefs()) do d[#d+1] = def end end
     return d
 end
 
-function tools.exec(name, input)
-    local ok, r = pcall(tools._exec, name, input)
+-- ctx: {reqId=request the caller is streaming, remote=true for another computer's message}
+function tools.exec(name, input, ctx)
+    local ok, r, blocked = pcall(guard.run, name, input, ctx, tools._exec)
     if not ok then return {error=tostring(r)} end
-    progress.track(name, r)
+    if not blocked then progress.track(name, r) end
     return r
 end
 
 function tools._exec(name, input)
+    if logistics and logistics.handlers[name] then return logistics.handlers[name](input) end
     if name == "read_file" then
         if not fs.exists(input.path) then return {error="Not found: "..input.path} end
         if fs.isDir(input.path) then return {error="Is a directory"} end
@@ -334,14 +397,7 @@ function tools._exec(name, input)
         srch(input.path)
         return {matches=results, count=#results, truncated=#results>=MAX}
     elseif name == "run_command" then
-        -- Block commands that could wipe the filesystem
-        local cmd = input.command:match("^%s*(%S+)")
-        if cmd == "rm" or cmd == "delete" then
-            local target = input.command:match("%s+(.+)$")
-            if target and (target:match("^/+$") or target:match("^%*") or target:match("%-r")) then
-                return {error="Blocked: destructive command. Use delete_path tool instead."}
-            end
-        end
+        -- Destructive commands are confirmed or refused by guard.run before we get here.
         local output, curY, curLine = {}, 1, ""
         local w = sW
         local fake = {}
@@ -735,7 +791,8 @@ function tools._exec(name, input)
         result.itemCount = #result.slots
         return result
     elseif name == "get_recipes" then
-        local json = claude.getRecipes(input.item, input.type)
+        local limit = math.max(1, math.min(50, math.floor(tonumber(input.limit) or 10)))
+        local json = claude.getRecipes(input.item, input.type, limit, 8)
         local ok2, data = pcall(textutils.unserialiseJSON, json)
         if ok2 and data then return data end
         return {error="Failed to parse recipe data"}
@@ -988,11 +1045,15 @@ sysPr = sysPr .. string.format(
 
 local toolDefs = tools.getDefs()
 
+-- Channel mode: Claude Code gives up on a tool call after 60s, so answer well before that.
+guard.init{ui=ui, colors=C, shell=shell, timeout=(backendMode == "channel") and 45 or 60,
+    getMonitor=function() return monitor, monSide end}
+
 -- Display helpers for tool calls/results
 local function showToolCall(name, input)
     local s = "[tool] "..name
     if input then
-        local d = input.path or input.pattern or input.command or input.action or ""
+        local d = input.path or input.pattern or input.command or input.action or input.query or input.item or ""
         if #d > 0 then s = s.." "..d end
     end
     ui.add(s, C.tool); ui.drawBody()
@@ -1046,6 +1107,7 @@ local function main()
     end
     if monitor then ui.add("Monitor: "..monSide.." ("..monW.."x"..monH..")", C.info) end
     ui.add("Type /help for commands.", C.sep)
+    if logisticsErr then ui.add("Logistics tools not loaded: "..tostring(logisticsErr), C.err) end
     ui.blank(); ui.drawBody()
 
     local msgs = hist.load() or {}
@@ -1085,6 +1147,7 @@ local function main()
             ui.add("  /stats    - Token usage & cost", C.ai)
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /confirm  - Ask before risky tools", C.ai)
             ui.add("  /help     - This help", C.ai)
             ui.add("  exit      - Quit", C.ai)
             ui.add("Scroll: mouse wheel / PgUp/PgDn", C.ai)
@@ -1095,12 +1158,13 @@ local function main()
             ui.blank(); ui.drawBody(); goto continue
         end
 
+        if inp == "/confirm" or inp:match("^/confirm%s") then
+            guard.command(inp:sub(9)); ui.blank(); ui.drawBody(); goto continue
+        end
+
         if inp == "/stats" then
             ui.add("Session Stats:", C.info)
-            ui.add(string.format("  Requests: %d", stats.requests), C.ai)
-            ui.add(string.format("  Tokens in:  %d", stats.totalIn), C.ai)
-            ui.add(string.format("  Tokens out: %d", stats.totalOut), C.ai)
-            ui.add(string.format("  Est. cost:  $%.4f", estimateCost(stats.totalIn, stats.totalOut)), C.ai)
+            for _, line in ipairs(stats.report()) do ui.add(line, C.ai) end
             ui.blank(); ui.drawBody(); goto continue
         end
 
@@ -1162,7 +1226,7 @@ local function main()
                         if ok2 and parsed then input = parsed end
                     end
                     showToolCall(p3, input)
-                    local r = tools.exec(p3, input)
+                    local r = tools.exec(p3, input, {reqId=reqId})
                     showToolResult(p3, r)
                     claude.sendToolResult(reqId, p2, textutils.serialiseJSON(r))
 
@@ -1224,7 +1288,7 @@ local function main()
 
                 -- Collect streaming events
                 while not done do
-                    local ev, p1, p2, p3, p4 = os.pullEvent()
+                    local ev, p1, p2, p3, p4, p5, p6 = os.pullEvent()
 
                     if ev == "claude_delta" and p1 == reqId then
                         responseText = responseText .. p2
@@ -1247,17 +1311,14 @@ local function main()
                     elseif ev == "claude_done" and p1 == reqId then
                         done = true
                         term.setCursorPos(1,sH); term.clearLine()
-                        -- p2=stopReason, p3=inputTokens, p4=outputTokens
+                        -- p2=stopReason, p3=inputTokens (uncached), p4=outputTokens,
+                        -- p5=cacheCreationTokens, p6=cacheReadTokens
                         if responseText and #responseText > 0 then
                             ui.add(responseText, C.ai); ui.blank()
                         end
-                        stats.requests = stats.requests + 1
-                        if p3 and p4 then
-                            stats.totalIn = stats.totalIn + (p3 or 0)
-                            stats.totalOut = stats.totalOut + (p4 or 0)
-                        end
-                        if p3 and p4 and (p3 > 0 or p4 > 0) then
-                            ui.add(string.format("(%s in / %s out)", tostring(p3), tostring(p4)), C.sep)
+                        stats.record(p3, p4, p5, p6)
+                        if (p3 or 0) + (p4 or 0) + (p5 or 0) + (p6 or 0) > 0 then
+                            ui.add(stats.usageLine(p3, p4, p5, p6), C.sep)
                         end
                         ui.drawBody()
 
@@ -1289,7 +1350,7 @@ local function main()
                     local results = {}
                     for _, tc in ipairs(toolCalls) do
                         showToolCall(tc.name, tc.input)
-                        local r = tools.exec(tc.name, tc.input)
+                        local r = tools.exec(tc.name, tc.input, {reqId=reqId})
                         showToolResult(tc.name, r)
                         results[#results+1] = {type="tool_result", tool_use_id=tc.id, content=textutils.serialiseJSON(r)}
                     end
@@ -1329,7 +1390,8 @@ local function incomingMessageHandler()
                 if ok2 and parsed then input = parsed end
             end
             showToolCall(p3, input)
-            local r = tools.exec(p3, input)
+            -- No player asked for this: destructive tools always need a y/n here.
+            local r = tools.exec(p3, input, {reqId=p1, remote=true})
             showToolResult(p3, r)
             claude.sendToolResult(p1, p2, textutils.serialiseJSON(r))
 

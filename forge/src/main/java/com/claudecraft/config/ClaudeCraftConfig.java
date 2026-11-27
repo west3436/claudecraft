@@ -22,6 +22,7 @@ public class ClaudeCraftConfig {
     public static final ModConfigSpec.BooleanValue ALLOW_SERVER_TOOLS;
     public static final ModConfigSpec.IntValue TOOL_TIMEOUT_SECONDS;
     public static final ModConfigSpec.ConfigValue<String> PERSONALITY;
+    public static final ModConfigSpec.BooleanValue ENABLE_PROMPT_CACHING;
 
     public static final ModConfigSpec.BooleanValue ENABLE_CHANNEL_MODE;
     public static final ModConfigSpec.IntValue MAX_CHANNEL_SESSIONS;
@@ -78,6 +79,11 @@ public class ClaudeCraftConfig {
         PERSONALITY = builder
                 .comment("Personality prefix for the system prompt (e.g. 'You are a grumpy dwarf miner'). Empty for default behavior.")
                 .define("personality", "");
+
+        ENABLE_PROMPT_CACHING = builder
+                .comment("Use Anthropic prompt caching (API key mode only). Caches the tool list, system prompt and",
+                        "conversation so later agent rounds re-read them at a fraction of the input price.")
+                .define("enablePromptCaching", true);
 
         builder.pop();
 

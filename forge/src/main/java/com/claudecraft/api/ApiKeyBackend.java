@@ -79,6 +79,7 @@ public class ApiKeyBackend implements ClaudeBackend {
             return handle;
         }
         body.addProperty("stream", true);
+        PromptCaching.apply(body);
 
         int timeout = ClaudeCraftConfig.REQUEST_TIMEOUT_SECONDS.get();
 
@@ -169,6 +170,16 @@ public class ApiKeyBackend implements ClaudeBackend {
         }
     }
 
+    /** Read an integer usage field, tolerating absent or null values. */
+    private static int usageInt(JsonObject usage, String key, int fallback) {
+        if (usage == null || !usage.has(key) || usage.get(key).isJsonNull()) return fallback;
+        try {
+            return usage.get(key).getAsInt();
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
     /**
      * Parse an Anthropic API SSE stream using the shared {@link SSEParser}.
      */
@@ -178,6 +189,8 @@ public class ApiKeyBackend implements ClaudeBackend {
         String currentToolName = null;
         StringBuilder currentToolInput = new StringBuilder();
         int inputTokens = 0;
+        int cacheCreationTokens = 0;
+        int cacheReadTokens = 0;
         boolean receivedTerminalEvent = false;
 
         try (SSEParser parser = new SSEParser(inputStream)) {
@@ -194,9 +207,11 @@ public class ApiKeyBackend implements ClaudeBackend {
                             JsonObject message = json.getAsJsonObject("message");
                             if (message != null && message.has("usage")) {
                                 JsonObject usage = message.getAsJsonObject("usage");
-                                if (usage.has("input_tokens")) {
-                                    inputTokens = usage.get("input_tokens").getAsInt();
-                                }
+                                inputTokens = usageInt(usage, "input_tokens", inputTokens);
+                                cacheCreationTokens = usageInt(usage,
+                                        "cache_creation_input_tokens", cacheCreationTokens);
+                                cacheReadTokens = usageInt(usage,
+                                        "cache_read_input_tokens", cacheReadTokens);
                             }
                         }
                         case "content_block_start" -> {
@@ -248,9 +263,17 @@ public class ApiKeyBackend implements ClaudeBackend {
                             String stopReason = delta != null && delta.has("stop_reason")
                                     ? delta.get("stop_reason").getAsString() : "end_turn";
                             JsonObject usage = json.getAsJsonObject("usage");
-                            int outTokens = usage != null && usage.has("output_tokens")
-                                    ? usage.get("output_tokens").getAsInt() : 0;
-                            callbacks.onComplete(stopReason, inputTokens, outTokens);
+                            // message_delta usage is cumulative. When it repeats the input
+                            // and cache counts, take the larger of it and message_start.
+                            int outTokens = usageInt(usage, "output_tokens", 0);
+                            inputTokens = Math.max(inputTokens,
+                                    usageInt(usage, "input_tokens", 0));
+                            cacheCreationTokens = Math.max(cacheCreationTokens,
+                                    usageInt(usage, "cache_creation_input_tokens", 0));
+                            cacheReadTokens = Math.max(cacheReadTokens,
+                                    usageInt(usage, "cache_read_input_tokens", 0));
+                            callbacks.onComplete(stopReason, inputTokens, outTokens,
+                                    cacheCreationTokens, cacheReadTokens);
                         }
                         case "message_stop" -> {
                             // Stream complete
