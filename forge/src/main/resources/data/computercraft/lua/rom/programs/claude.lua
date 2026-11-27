@@ -1072,6 +1072,37 @@ local function main()
         if not inp or inp == "exit" or inp == "quit" then break end
         if #inp == 0 then goto continue end
 
+        -- Inter-computer message allowlist (channel mode): /allow, /deny, /allowlist
+        do
+            local acmd, arest = inp:match("^/(%a+)%s*(.*)$")
+            if acmd == "allow" or acmd == "deny" or acmd == "allowlist" then
+                local ids, bad = {}, false
+                for tok in arest:gmatch("%S+") do
+                    local n = tonumber(tok)
+                    if n and n >= 0 and n == math.floor(n) then ids[#ids+1] = n else bad = true end
+                end
+                if acmd ~= "allowlist" and (bad or #ids == 0) then
+                    ui.add("Usage: /"..acmd.." <computer id> [more ids]", C.err)
+                else
+                    if acmd ~= "allowlist" then
+                        local set = {}
+                        for _, id in ipairs(claude.getMessageAllowlist()) do set[id] = true end
+                        for _, id in ipairs(ids) do set[id] = (acmd == "allow") or nil end
+                        local list = {}
+                        for id in pairs(set) do list[#list+1] = id end
+                        local ok, err = pcall(claude.setMessageAllowlist, list)
+                        if not ok then ui.add("Error: "..tostring(err), C.err) end
+                    end
+                    local shown = {}
+                    for i, id in ipairs(claude.getMessageAllowlist()) do shown[i] = "#"..id end
+                    if #shown == 0 then ui.add("No computer may message this one.", C.info)
+                    else ui.add("Accepting messages from: "..table.concat(shown, ", "), C.info) end
+                    ui.add("/allow <id> or /deny <id> to change.", C.sep)
+                end
+                ui.blank(); ui.drawBody(); goto continue
+            end
+        end
+
         if inp == "/clear" then msgs={}; hist.clear(); ui.clear(); ui.add("Cleared.", C.info); ui.drawBody(); goto continue end
         if inp == "/mode" then
             fs.delete(MODE_FILE)

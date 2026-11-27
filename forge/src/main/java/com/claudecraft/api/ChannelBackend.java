@@ -29,11 +29,17 @@ public class ChannelBackend implements ClaudeBackend {
     private static final int TOOL_RESULT_MAX_RETRIES = 2;
 
     private final int port;
+    /** Per-session secret sent as a Bearer token; the server rejects requests without it. */
+    private final String token;
+    /** The computer this backend serves; /health must report the same ID. */
+    private final int computerId;
     private final HttpClient httpClient;
     private final ExecutorService executor;
 
-    public ChannelBackend(int port) {
+    public ChannelBackend(int port, String token, int computerId) {
         this.port = port;
+        this.token = token;
+        this.computerId = computerId;
         this.executor = Executors.newCachedThreadPool(r -> {
             Thread t = new Thread(r, "ClaudeCraft-Channel-" + port);
             t.setDaemon(true);
@@ -47,6 +53,13 @@ public class ChannelBackend implements ClaudeBackend {
 
     private String getBaseUrl() {
         return "http://127.0.0.1:" + port;
+    }
+
+    /** A request to the channel server carrying this session's Bearer token. */
+    private HttpRequest.Builder authorizedRequest(String pathAndQuery) {
+        return HttpRequest.newBuilder()
+                .uri(URI.create(getBaseUrl() + pathAndQuery))
+                .header("authorization", "Bearer " + token);
     }
 
     /**
@@ -100,8 +113,7 @@ public class ChannelBackend implements ClaudeBackend {
                 }
 
                 // POST /message
-                HttpRequest postReq = HttpRequest.newBuilder()
-                        .uri(URI.create(getBaseUrl() + "/message"))
+                HttpRequest postReq = authorizedRequest("/message")
                         .timeout(Duration.ofSeconds(15))
                         .header("content-type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString(messageBody.toString()))
@@ -110,6 +122,11 @@ public class ChannelBackend implements ClaudeBackend {
                 HttpResponse<String> postResp = httpClient.send(postReq,
                         HttpResponse.BodyHandlers.ofString());
 
+                if (postResp.statusCode() == 401) {
+                    callbacks.onError("Channel server rejected this session's token. "
+                            + "Exit and run 'claude' again to restart the session.");
+                    return;
+                }
                 if (postResp.statusCode() != 200) {
                     callbacks.onError("Channel server error: HTTP " + postResp.statusCode());
                     return;
@@ -122,8 +139,8 @@ public class ChannelBackend implements ClaudeBackend {
                 // The heartbeat (every 15s) keeps the connection alive for legitimate
                 // long-running operations, but this prevents infinite hangs if the
                 // channel server dies completely without closing the connection.
-                HttpRequest sseReq = HttpRequest.newBuilder()
-                        .uri(URI.create(getBaseUrl() + "/events?request_id=" + requestId))
+                HttpRequest sseReq = authorizedRequest("/events?request_id="
+                                + java.net.URLEncoder.encode(requestId, StandardCharsets.UTF_8))
                         .timeout(SSE_TIMEOUT)
                         .header("accept", "text/event-stream")
                         .GET()
@@ -175,8 +192,7 @@ public class ChannelBackend implements ClaudeBackend {
             body.addProperty("callId", callId);
             body.addProperty("result", resultJson);
 
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(getBaseUrl() + "/tool-result"))
+            HttpRequest request = authorizedRequest("/tool-result")
                     .timeout(Duration.ofSeconds(10))
                     .header("content-type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
@@ -217,11 +233,15 @@ public class ChannelBackend implements ClaudeBackend {
         });
     }
 
+    /**
+     * Healthy only if the server accepts this session's token, reports this
+     * computer's ID (so we never attach to another computer's orphaned server
+     * on a reused port), and still has its MCP connection to Claude Code.
+     */
     @Override
     public boolean isConfigured() {
         try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(getBaseUrl() + "/health"))
+            HttpRequest request = authorizedRequest("/health")
                     .timeout(Duration.ofSeconds(2))
                     .GET()
                     .build();
@@ -230,16 +250,14 @@ public class ChannelBackend implements ClaudeBackend {
                     HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() != 200) return false;
 
-            // Check that Claude Code MCP connection is still alive
-            try {
-                JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
-                if (body.has("mcpConnected") && !body.get("mcpConnected").getAsBoolean()) {
-                    return false;
-                }
-            } catch (Exception ignored) {
-                // Old server format — treat 200 as healthy
+            JsonObject body = JsonParser.parseString(response.body()).getAsJsonObject();
+            if (!body.has("computerId")
+                    || !String.valueOf(computerId).equals(body.get("computerId").getAsString())) {
+                ClaudeCraft.LOGGER.warn("Channel server on port {} reports computer {}, expected {}",
+                        port, body.has("computerId") ? body.get("computerId") : "none", computerId);
+                return false;
             }
-            return true;
+            return body.has("mcpConnected") && body.get("mcpConnected").getAsBoolean();
         } catch (Exception e) {
             return false;
         }
@@ -253,8 +271,7 @@ public class ChannelBackend implements ClaudeBackend {
     public void connectGlobalSSE(StreamCallbacks callbacks) {
         executor.submit(() -> {
             try {
-                HttpRequest sseReq = HttpRequest.newBuilder()
-                        .uri(URI.create(getBaseUrl() + "/events"))
+                HttpRequest sseReq = authorizedRequest("/events")
                         .header("accept", "text/event-stream")
                         .GET()
                         .build();

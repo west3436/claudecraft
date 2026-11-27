@@ -36,11 +36,17 @@ public class ChannelProcessManager {
         public final int computerId;
         public final int port;
         public final Process process;
+        /** Secret the mod sends as a Bearer token on every channel server request. */
+        public final String token;
+        /** Secret other channel servers use to deliver to /incoming-message (in the registry). */
+        public final String inboxToken;
 
-        SessionInfo(int computerId, int port, Process process) {
+        SessionInfo(int computerId, int port, Process process, String token, String inboxToken) {
             this.computerId = computerId;
             this.port = port;
             this.process = process;
+            this.token = token;
+            this.inboxToken = inboxToken;
         }
     }
 
@@ -84,8 +90,13 @@ public class ChannelProcessManager {
         // Write CLAUDE.md
         writeCLAUDEmd(sandboxDir, computerId, isTurtle, label, termWidth, termHeight);
 
+        // Per-session secrets for the channel server (see ChannelSecrets)
+        String token = ChannelSecrets.newToken();
+        String inboxToken = ChannelSecrets.newToken();
+
         // Write .mcp.json
-        writeMcpJson(sandboxDir, port, computerId, isTurtle, label, termWidth, termHeight);
+        writeMcpJson(sandboxDir, port, computerId, isTurtle, label, termWidth, termHeight,
+                token, inboxToken);
 
         // Refactor R1: Generate permissions from ToolDefinitions instead of hardcoding
         Path claudeSettingsDir = sandboxDir.resolve(".claude");
@@ -137,7 +148,7 @@ public class ChannelProcessManager {
 
         Process process = pb.start();
 
-        SessionInfo session = new SessionInfo(computerId, port, process);
+        SessionInfo session = new SessionInfo(computerId, port, process, token, inboxToken);
         sessions.put(computerId, session);
 
         writeRegistry();
@@ -215,25 +226,27 @@ public class ChannelProcessManager {
     }
 
     /**
-     * Write the channel registry file mapping computerId -> port.
-     * Used by channel servers for inter-computer messaging.
+     * Write the channel registry file mapping computerId -> {port, inboxToken}.
+     * Used by channel servers for inter-computer messaging: the inbox token lets a
+     * sender deliver to that computer's /incoming-message and nothing else.
      */
     private void writeRegistry() {
         try {
             Path registryFile = Path.of(System.getProperty("user.home"),
                     ".claudecraft", "channel-registry.json");
             Files.createDirectories(registryFile.getParent());
+            ChannelSecrets.restrictToOwner(registryFile.getParent());
 
-            StringBuilder json = new StringBuilder("{\n");
-            boolean first = true;
+            com.google.gson.JsonObject json = new com.google.gson.JsonObject();
             for (var entry : sessions.entrySet()) {
-                if (!first) json.append(",\n");
-                json.append("  \"").append(entry.getKey()).append("\": ").append(entry.getValue().port);
-                first = false;
+                com.google.gson.JsonObject info = new com.google.gson.JsonObject();
+                info.addProperty("port", entry.getValue().port);
+                info.addProperty("inboxToken", entry.getValue().inboxToken);
+                json.add(String.valueOf(entry.getKey()), info);
             }
-            json.append("\n}");
 
             Files.writeString(registryFile, json.toString());
+            ChannelSecrets.restrictToOwner(registryFile);
         } catch (Exception e) {
             ClaudeCraft.LOGGER.warn("Failed to write channel registry: {}", e.getMessage());
         }
@@ -284,7 +297,8 @@ public class ChannelProcessManager {
     }
 
     private void writeMcpJson(Path dir, int port, int computerId, boolean isTurtle,
-                               String label, int termWidth, int termHeight) throws Exception {
+                               String label, int termWidth, int termHeight,
+                               String token, String inboxToken) throws Exception {
         Path channelScript = ChannelResourceManager.getInstance()
                 .getChannelDir().resolve("claudecraft-channel.ts");
 
@@ -306,17 +320,29 @@ public class ChannelProcessManager {
         }
         args.append("\n    ]");
 
+        // Secrets go in env, not args: args are visible to other users in process listings.
+        // Tokens are URL-safe base64, so they need no JSON escaping.
         String content = String.format("""
                 {
                   "mcpServers": {
                     "claudecraft": {
                       "command": "bun",
-                      "args": %s
+                      "args": %s,
+                      "env": {
+                        "%s": "%s",
+                        "%s": "%s"
+                      }
                     }
                   }
                 }
-                """, args);
+                """, args,
+                ChannelSecrets.TOKEN_ENV, token,
+                ChannelSecrets.INBOX_TOKEN_ENV, inboxToken);
 
-        Files.writeString(dir.resolve(".mcp.json"), content);
+        // Lock the sandbox dir first so the token is never briefly world-readable.
+        ChannelSecrets.restrictToOwner(dir);
+        Path mcpJson = dir.resolve(".mcp.json");
+        Files.writeString(mcpJson, content);
+        ChannelSecrets.restrictToOwner(mcpJson);
     }
 }

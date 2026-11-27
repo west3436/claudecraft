@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *   claude.sendMessage(messages, tools, system)   -> requestId (string)
  *   claude.sendToolResult(reqId, callId, result)  -> nil
  *   claude.cancelRequest(requestId)               -> nil
+ *   claude.getMessageAllowlist()                  -> {computerId, ...}
+ *   claude.setMessageAllowlist({computerId, ...}) -> {computerId, ...} (as stored)
  *
  * Events pushed to the computer:
  *   -- API key mode (streaming):
@@ -157,7 +159,7 @@ public class ClaudeAPI implements ILuaAPI {
                     ChannelProcessManager.getInstance().startSession(
                             computerId, isTurtle, label, termW, termH);
 
-            channelBackend = new ChannelBackend(session.port);
+            channelBackend = new ChannelBackend(session.port, session.token, computerId);
 
             // Start a persistent global SSE listener for incoming inter-computer messages.
             channelBackend.connectGlobalSSE(createChannelCallbacks("incoming"));
@@ -190,6 +192,49 @@ public class ClaudeAPI implements ILuaAPI {
     @LuaFunction
     public final boolean isChannelReady() {
         return channelBackend != null && channelBackend.isConfigured();
+    }
+
+    /**
+     * Computer IDs allowed to send inter-computer messages to this computer
+     * (channel mode). Empty by default: all incoming messages are rejected.
+     */
+    @LuaFunction
+    public final Map<Integer, Integer> getMessageAllowlist() {
+        return toLuaList(com.claudecraft.channel.MessageAllowlist.get(computer.getID()));
+    }
+
+    /**
+     * Replace this computer's message allowlist. Takes a list of computer IDs and
+     * returns the list as stored (sorted, duplicates removed). Takes effect for the
+     * next incoming message; no session restart needed.
+     */
+    @LuaFunction
+    public final Map<Integer, Integer> setMessageAllowlist(@NotNull IArguments args) throws LuaException {
+        Map<?, ?> table = args.getTable(0);
+        List<Integer> ids = new ArrayList<>();
+        for (Object value : table.values()) {
+            if (!(value instanceof Number n) || n.doubleValue() != Math.floor(n.doubleValue())
+                    || n.doubleValue() < 0 || n.doubleValue() > Integer.MAX_VALUE) {
+                throw new LuaException("Computer IDs must be non-negative integers");
+            }
+            ids.add(n.intValue());
+        }
+        try {
+            return toLuaList(com.claudecraft.channel.MessageAllowlist.set(computer.getID(), ids));
+        } catch (IllegalArgumentException e) {
+            throw new LuaException(e.getMessage());
+        } catch (Exception e) {
+            ClaudeCraft.LOGGER.warn("Failed to save message allowlist for computer #{}",
+                    computer.getID(), e);
+            throw new LuaException("Could not save allowlist: " + e.getMessage());
+        }
+    }
+
+    /** 1-indexed map, which CC:Tweaked returns to Lua as a list. */
+    private static Map<Integer, Integer> toLuaList(List<Integer> ids) {
+        Map<Integer, Integer> out = new HashMap<>();
+        for (int i = 0; i < ids.size(); i++) out.put(i + 1, ids.get(i));
+        return out;
     }
 
     /**
