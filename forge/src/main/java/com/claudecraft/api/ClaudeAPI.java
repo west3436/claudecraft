@@ -165,6 +165,12 @@ public class ClaudeAPI implements ILuaAPI {
         int termW = args.optInt(2).orElse(51);
         int termH = args.optInt(3).orElse(19);
         JsonArray toolDefs = args.optTable(4).map(this::luaMapToJsonArray).orElseGet(JsonArray::new);
+        if (!toolDefs.isEmpty()) {
+            // Same server policy as API-key mode (http_request needs enableWebAccess).
+            // Anthropic-run server tools can't be served over MCP, so they are always dropped.
+            toolDefs = ToolPolicy.apply(toolDefs, false,
+                    ClaudeCraftConfig.ENABLE_WEB_ACCESS.get(), computer.getID());
+        }
         JsonObject toolTimeouts = new JsonObject();
         args.optTable(5).ifPresent(t -> {
             JsonElement el = luaValueToJson(t, null);
