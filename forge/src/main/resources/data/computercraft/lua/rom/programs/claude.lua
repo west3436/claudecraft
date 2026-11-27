@@ -234,6 +234,8 @@ end
 ----------------------------------------------------------------------
 -- TOOLS (same as standalone, executed Lua-side)
 ----------------------------------------------------------------------
+local memory = require("claudecraft.memory") -- per-computer memory: /.claude/memory.md
+local atlas = require("claudecraft.atlas")   -- shared, world-saved base atlas
 local tools = {}
 
 function tools.getDefs()
@@ -267,6 +269,8 @@ function tools.getDefs()
         d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
+    for _, def in ipairs(memory.toolDefs()) do d[#d+1] = def end -- remember, forget
+    for _, def in ipairs(atlas.toolDefs()) do d[#d+1] = def end  -- set/list/remove_waypoint, atlas_search
     return d
 end
 
@@ -274,10 +278,13 @@ function tools.exec(name, input)
     local ok, r = pcall(tools._exec, name, input)
     if not ok then return {error=tostring(r)} end
     progress.track(name, r)
+    atlas.observe(name, input, r) -- index scan_inventory results in the base atlas
     return r
 end
 
 function tools._exec(name, input)
+    local ext = memory.exec(name, input) or atlas.exec(name, input) -- module-provided tools
+    if ext then return ext end
     if name == "read_file" then
         if not fs.exists(input.path) then return {error="Not found: "..input.path} end
         if fs.isDir(input.path) then return {error="Is a directory"} end
@@ -985,6 +992,7 @@ sysPr = sysPr .. string.format(
     turtle and string.format("TURTLE. Fuel: %s/%s. ", tostring(turtle.getFuelLevel()), tostring(turtle.getFuelLimit())) or "",
     (claude.isWebAccessEnabled() and http) and "HTTP requests, " or "",
     turtle and "turtle control, " or "")
+local baseSysPr = sysPr -- memory.promptSection() is appended fresh each user turn
 
 local toolDefs = tools.getDefs()
 
@@ -1085,6 +1093,7 @@ local function main()
             ui.add("  /stats    - Token usage & cost", C.ai)
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /memory   - Show memory (/memory clear)", C.ai)
             ui.add("  /help     - This help", C.ai)
             ui.add("  exit      - Quit", C.ai)
             ui.add("Scroll: mouse wheel / PgUp/PgDn", C.ai)
@@ -1134,8 +1143,11 @@ local function main()
             ui.blank(); ui.drawBody(); goto continue
         end
 
+        if inp == "/memory" or inp:match("^/memory%s") then memory.command(inp, ui, C); goto continue end
+
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
         msgs[#msgs+1] = {role="user", content=inp}
+        sysPr = baseSysPr .. memory.promptSection() -- reload /.claude/memory.md every turn
 
         if backendMode == "channel" then
             ----------------------------------------------------------------

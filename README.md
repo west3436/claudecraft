@@ -74,6 +74,16 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 | `turtle_goto` | Navigate to GPS coordinates with pathfinding |
 | `build_structure` | Execute multi-block builds from blueprints |
 
+### Memory & Base Atlas
+
+| Tool | Description |
+|---|---|
+| `remember` / `forget` | Per-computer notes in `/.claude/memory.md`, shown to Claude every turn (`/memory` to view) |
+| `set_waypoint` / `list_waypoints` / `remove_waypoint` | Named locations in a world-saved atlas shared by all computers |
+| `atlas_search` | "Where are my diamonds?" from stored `scan_inventory` results, with scan age |
+
+See [docs/memory-and-atlas.md](docs/memory-and-atlas.md).
+
 ## In-Game Commands
 
 | Command | Description |
