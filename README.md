@@ -83,7 +83,7 @@ If you use `setkey`, run it from the server console where you can. Chat commands
 | `turtle_inspect` | Inspect blocks around the turtle |
 | `turtle_inventory` | Manage the turtle's inventory |
 | `turtle_goto` | Navigate to GPS coordinates with pathfinding |
-| `build_structure` | Execute multi-block builds from blueprints |
+| `build_structure` | Build from shapes (box, hollow box, wall, floor, cylinder, sphere/dome, gable roof) or single blocks, in coordinates relative to the turtle. `dry_run` reports size, materials vs inventory and fuel without moving; optional restock chest and monitor preview |
 
 ### Memory & Base Atlas
 
