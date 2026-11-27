@@ -73,6 +73,7 @@ function progress.track(toolName, result)
     elseif toolName == "run_command" then p.commands_run = (p.commands_run or 0) + 1
     elseif toolName == "turtle_move" and result and result.results then p.moves = (p.moves or 0) + (result.completed or 0)
     elseif toolName == "turtle_goto" and result and result.success then p.moves = (p.moves or 0) + (result.steps or 0)
+    elseif toolName == "turtle_craft" and result and result.crafted then p.items_crafted = (p.items_crafted or 0) + result.crafted
     end
     progress.save(p)
 end
@@ -236,6 +237,12 @@ end
 ----------------------------------------------------------------------
 local tools = {}
 
+-- Item logistics tools (find_item, move_items, sort_storage, fluid_tanks,
+-- turtle_craft, turtle_equip): /rom/modules/main/claudecraft/logistics.lua
+local okLogistics, logistics = pcall(require, "claudecraft.logistics")
+local logisticsErr
+if not okLogistics then logisticsErr, logistics = logistics, nil end
+
 function tools.getDefs()
     local d = {
         {name="read_file", description="Read a file.", input_schema={type="object",properties={path={type="string"}},required={"path"}}},
@@ -250,7 +257,7 @@ function tools.getDefs()
         {name="get_info", description="System info: ID, fuel, peripherals.", input_schema={type="object",properties={}}},
         {name="redstone", description="Redstone I/O.", input_schema={type="object",properties={action={type="string"},side={type="string"},value={type="number"}},required={"action","side"}}},
         {name="peripheral_call", description="Call peripheral method.", input_schema={type="object",properties={side={type="string"},method={type="string"},args={type="array",description="Arguments to pass"}},required={"side","method"}}},
-        {name="get_recipes", description="Get Minecraft crafting/smelting/smithing recipes from the server. Returns all recipes, optionally filtered by output item name or recipe type.", input_schema={type="object",properties={item={type="string",description="Filter by output item (e.g. 'iron_pickaxe', 'diamond')"},type={type="string",description="Filter by recipe type (e.g. 'crafting', 'smelting', 'smithing')"}}}},
+        {name="get_recipes", description="Look up Minecraft recipes (crafting/smelting/smithing...) on the server. Needs an item or type filter. Exact output matches come first; results are capped. Shaped recipes have width, height and grid (row-major, 0 = empty, else 1-based index into ingredients). To craft on a turtle, use turtle_craft.", input_schema={type="object",properties={item={type="string",description="Output item (e.g. 'iron_pickaxe', 'minecraft:torch')"},type={type="string",description="Recipe type (e.g. 'crafting', 'smelting', 'smithing')"},limit={type="number",description="Max recipes (default 10, max 50)"}}}},
         {name="scan_inventory", description="Scan a container's inventory (chest, barrel, shulker box, etc.) via peripheral. Returns all items with slot, name, and count. Use with get_recipes to plan crafting sequences — find available materials across nearby chests, then craft intermediate and final items.", input_schema={type="object",properties={peripheral={type="string",description="Peripheral name or side (e.g. 'minecraft:chest_0', 'left')"},detailed={type="boolean",description="If true, fetch full item details per slot including displayName, nbt, tags (slower). Default: false"}},required={"peripheral"}}},
     }
     d[#d+1] = {name="scan_area", description="Scan surrounding area for blocks. Uses block scanner peripheral if available, otherwise turtle inspect on all 6 sides.", input_schema={type="object",properties={radius={type="number",description="Scan radius (default 1). Only used with block scanner peripheral."}}}}
@@ -267,6 +274,7 @@ function tools.getDefs()
         d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
+    if logistics then for _, def in ipairs(logistics.getDefs()) do d[#d+1] = def end end
     return d
 end
 
@@ -278,6 +286,7 @@ function tools.exec(name, input)
 end
 
 function tools._exec(name, input)
+    if logistics and logistics.handlers[name] then return logistics.handlers[name](input) end
     if name == "read_file" then
         if not fs.exists(input.path) then return {error="Not found: "..input.path} end
         if fs.isDir(input.path) then return {error="Is a directory"} end
@@ -735,7 +744,8 @@ function tools._exec(name, input)
         result.itemCount = #result.slots
         return result
     elseif name == "get_recipes" then
-        local json = claude.getRecipes(input.item, input.type)
+        local limit = math.max(1, math.min(50, math.floor(tonumber(input.limit) or 10)))
+        local json = claude.getRecipes(input.item, input.type, limit, 8)
         local ok2, data = pcall(textutils.unserialiseJSON, json)
         if ok2 and data then return data end
         return {error="Failed to parse recipe data"}
@@ -992,7 +1002,7 @@ local toolDefs = tools.getDefs()
 local function showToolCall(name, input)
     local s = "[tool] "..name
     if input then
-        local d = input.path or input.pattern or input.command or input.action or ""
+        local d = input.path or input.pattern or input.command or input.action or input.query or input.item or ""
         if #d > 0 then s = s.." "..d end
     end
     ui.add(s, C.tool); ui.drawBody()
@@ -1046,6 +1056,7 @@ local function main()
     end
     if monitor then ui.add("Monitor: "..monSide.." ("..monW.."x"..monH..")", C.info) end
     ui.add("Type /help for commands.", C.sep)
+    if logisticsErr then ui.add("Logistics tools not loaded: "..tostring(logisticsErr), C.err) end
     ui.blank(); ui.drawBody()
 
     local msgs = hist.load() or {}
