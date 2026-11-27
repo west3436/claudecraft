@@ -92,7 +92,15 @@ If you use `setkey`, run it from the server console where you can. Chat commands
 | `/claudecraft setkey <key>` | Save your Anthropic API key to the server-only secrets file |
 | `/claudecraft clearkey` | Delete the secrets file |
 | `/claudecraft model <model>` | Change the Claude model |
-| `/claudecraft status` | Show current configuration |
+| `/claudecraft status` | Show where the API key comes from (never the key), the model, and channel mode status |
+| `/claudecraft channel enable` \| `disable` | Turn channel mode on or off. Disabling stops every running session |
+| `/claudecraft channel allow <computerId>` | Let a computer use channel mode |
+| `/claudecraft channel deny <computerId>` | Remove a computer from the allowlist and stop its session |
+| `/claudecraft channel list` | Show whether channel mode is on, the session limit, and the allowed computers |
+| `/claudecraft channel sessions` | List running Claude Code sessions with status, port, PID and uptime |
+| `/claudecraft channel kill <computerId>` | Stop one computer's Claude Code session |
+
+All `/claudecraft` commands need operator level 3.
 
 ## Building from Source
 
