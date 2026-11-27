@@ -581,6 +581,39 @@ public class ClaudeAPI implements ILuaAPI {
         return recipeObj;
     }
 
+    // -- Shared base atlas (world-saved; logic in com.claudecraft.atlas.AtlasLua) --
+    //   claude.atlasSetWaypoint{name, x?, y?, z?, dimension?, note?, group?}  -> {waypoint, replaced, group}
+    //   claude.atlasListWaypoints{group?, filter?}                            -> {waypoints, count, total, group}
+    //   claude.atlasRemoveWaypoint(name, group?)                              -> {removed, waypoint?, group}
+    //   claude.atlasSearch(query, group?) / {query, group?, limit?}           -> {matches, totals, waypoints, ...}
+    //   claude.atlasRecordInventory{peripheral, items, size?, group?}         -> {key, exact, x, y, z, ...}
+    // Omitting x/y/z in atlasSetWaypoint uses this computer's position. Groups default to "default".
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasSetWaypoint(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.setWaypoint(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasListWaypoints(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.listWaypoints(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasRemoveWaypoint(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.removeWaypoint(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasSearch(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.search(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasRecordInventory(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.recordInventory(computer, args);
+    }
+
     // -- Callback factories --
 
     private ClaudeBackend.StreamCallbacks createApiKeyCallbacks(String requestId) {
