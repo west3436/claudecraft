@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *   claude.sendMessage(messages, tools, system)   -> requestId (string)
  *   claude.sendToolResult(reqId, callId, result)  -> nil
  *   claude.cancelRequest(requestId)               -> nil
+ *   claude.getRecipes(item, type, limit, maxAlts) -> JSON string (needs item or type filter)
  *   claude.getMessageAllowlist()                  -> {computerId, ...}
  *   claude.setMessageAllowlist({computerId, ...}) -> {computerId, ...} (as stored)
  *
@@ -39,7 +40,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   "claude_delta"      requestId, text
  *   "claude_tool_start" requestId, toolId, toolName
  *   "claude_tool_done"  requestId, toolId, toolName, inputJson
- *   "claude_done"       requestId, stopReason, inputTokens, outputTokens
+ *   "claude_done"       requestId, stopReason, inputTokens, outputTokens,
+ *                       cacheCreationTokens, cacheReadTokens
+ *                       (inputTokens is the uncached remainder; channel mode omits the cache fields)
  *   "claude_error"      requestId, errorMessage
  *
  *   -- Channel mode:
@@ -417,71 +420,165 @@ public class ClaudeAPI implements ILuaAPI {
         }
     }
 
+    private static final int DEFAULT_RECIPE_LIMIT = 20;
+    private static final int MAX_RECIPE_LIMIT = 100;
+
+    /** A recipe that passed the filters, kept until we sort and cap the results. */
+    private record RecipeMatch(RecipeHolder<?> holder, String type, String result, ItemStack resultStack, int rank) {}
+
     /**
-     * Get Minecraft recipes, optionally filtered by output item name or recipe type.
+     * Get Minecraft recipes filtered by output item name and/or recipe type.
+     * <p>
+     * At least one filter is required; an unfiltered call used to serialise every
+     * recipe on the server. Results are capped, exact output matches sort first,
+     * and a recipe that throws (broken modded recipe) is skipped rather than
+     * aborting the whole call. Runs on the server thread because it reads the
+     * RecipeManager and resolves ingredient tags.
+     * <p>
+     * Shaped recipes carry {@code width}, {@code height} and {@code grid}: a
+     * row-major array of width*height entries, each 0 for an empty cell or the
+     * 1-based index of that cell's entry in {@code ingredients}.
      *
-     * @param args Lua arguments: itemFilter (string|nil), typeFilter (string|nil)
-     * @return JSON string with matching recipes
+     * @param args Lua arguments: itemFilter (string|nil), typeFilter (string|nil),
+     *             limit (int|nil, default 20, max 100),
+     *             maxAlternatives (int|nil, items listed per ingredient, 0 = all)
+     * @return JSON string with matching recipes, or {"error": ...}
      */
-    @LuaFunction
+    @LuaFunction(mainThread = true)
     public final String getRecipes(@NotNull IArguments args) throws LuaException {
         MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
         if (server == null) {
             throw new LuaException("Server not available");
         }
 
-        String itemFilter = args.optString(0).orElse(null);
-        String typeFilter = args.optString(1).orElse(null);
+        String itemFilter = normaliseFilter(args.optString(0).orElse(null));
+        String typeFilter = normaliseFilter(args.optString(1).orElse(null));
+        int limit = Math.max(1, Math.min(MAX_RECIPE_LIMIT, args.optInt(2).orElse(DEFAULT_RECIPE_LIMIT)));
+        int maxAlternatives = Math.max(0, args.optInt(3).orElse(0));
+
+        if (itemFilter == null && typeFilter == null) {
+            JsonObject err = new JsonObject();
+            err.addProperty("error", "Give an item filter (e.g. 'iron_pickaxe') or a type filter (e.g. 'smelting'). "
+                    + "Listing every recipe on the server is not supported.");
+            return GSON.toJson(err);
+        }
 
         RecipeManager recipeManager = server.getRecipeManager();
         RegistryAccess registryAccess = server.registryAccess();
 
-        JsonArray results = new JsonArray();
+        List<RecipeMatch> matches = new ArrayList<>();
+        int skipped = 0;
 
         for (RecipeHolder<?> holder : recipeManager.getRecipes()) {
-            Recipe<?> recipe = holder.value();
+            try {
+                Recipe<?> recipe = holder.value();
 
-            ResourceLocation typeId = BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType());
-            String typeStr = typeId != null ? typeId.toString() : "unknown";
+                ResourceLocation typeId = BuiltInRegistries.RECIPE_TYPE.getKey(recipe.getType());
+                String typeStr = typeId != null ? typeId.toString() : "unknown";
+                if (typeFilter != null && !typeStr.contains(typeFilter)) continue;
 
-            if (typeFilter != null && !typeStr.contains(typeFilter)) continue;
+                ItemStack result = recipe.getResultItem(registryAccess);
+                // Special recipes (map cloning, firework stars, ...) have no fixed output.
+                if (result.isEmpty()) continue;
+                ResourceLocation resultId = BuiltInRegistries.ITEM.getKey(result.getItem());
+                String resultName = resultId != null ? resultId.toString() : "unknown";
 
-            ItemStack result = recipe.getResultItem(registryAccess);
-            ResourceLocation resultId = BuiltInRegistries.ITEM.getKey(result.getItem());
-            String resultName = resultId != null ? resultId.toString() : "unknown";
-
-            if (itemFilter != null && !resultName.contains(itemFilter)) continue;
-
-            JsonObject recipeObj = new JsonObject();
-            recipeObj.addProperty("id", holder.id().toString());
-            recipeObj.addProperty("type", typeStr);
-            recipeObj.addProperty("result", resultName);
-            recipeObj.addProperty("result_count", result.getCount());
-
-            JsonArray ingredients = new JsonArray();
-            for (Ingredient ingredient : recipe.getIngredients()) {
-                if (ingredient.isEmpty()) continue;
-                JsonArray items = new JsonArray();
-                for (ItemStack item : ingredient.getItems()) {
-                    ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(item.getItem());
-                    if (itemId != null) items.add(itemId.toString());
+                int rank = 0;
+                if (itemFilter != null) {
+                    if (!resultName.contains(itemFilter)) continue;
+                    String path = resultId != null ? resultId.getPath() : resultName;
+                    if (resultName.equals(itemFilter) || path.equals(itemFilter)) rank = 0;
+                    else if (path.startsWith(itemFilter)) rank = 1;
+                    else rank = 2;
                 }
-                if (items.size() > 0) ingredients.add(items);
+                matches.add(new RecipeMatch(holder, typeStr, resultName, result, rank));
+            } catch (Exception | LinkageError e) {
+                skipped++;
             }
-            recipeObj.add("ingredients", ingredients);
+        }
 
-            if (recipe instanceof ShapedRecipe shaped) {
-                recipeObj.addProperty("width", shaped.getWidth());
-                recipeObj.addProperty("height", shaped.getHeight());
+        matches.sort(Comparator.comparingInt(RecipeMatch::rank)
+                .thenComparingInt(m -> m.result().length())
+                .thenComparing(m -> m.holder().id().toString()));
+
+        JsonArray results = new JsonArray();
+        for (RecipeMatch match : matches) {
+            if (results.size() >= limit) break;
+            try {
+                results.add(recipeToJson(match, maxAlternatives));
+            } catch (Exception | LinkageError e) {
+                skipped++;
             }
-
-            results.add(recipeObj);
         }
 
         JsonObject response = new JsonObject();
         response.add("recipes", results);
         response.addProperty("count", results.size());
+        response.addProperty("total_matched", matches.size());
+        if (matches.size() > results.size()) {
+            response.addProperty("truncated", true);
+        }
+        if (skipped > 0) {
+            response.addProperty("skipped_broken", skipped);
+        }
         return GSON.toJson(response);
+    }
+
+    private static String normaliseFilter(String filter) {
+        if (filter == null) return null;
+        String f = filter.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", "_");
+        return f.isEmpty() ? null : f;
+    }
+
+    private static JsonObject recipeToJson(RecipeMatch match, int maxAlternatives) {
+        Recipe<?> recipe = match.holder().value();
+
+        JsonObject recipeObj = new JsonObject();
+        recipeObj.addProperty("id", match.holder().id().toString());
+        recipeObj.addProperty("type", match.type());
+        recipeObj.addProperty("result", match.result());
+        recipeObj.addProperty("result_count", match.resultStack().getCount());
+        recipeObj.addProperty("result_max_stack", match.resultStack().getMaxStackSize());
+
+        List<Ingredient> all = recipe.getIngredients();
+        JsonArray ingredients = new JsonArray();
+        // Grid cell -> 1-based ingredient index (0 = empty), only for shaped recipes.
+        int[] grid = new int[all.size()];
+        boolean truncatedAlternatives = false;
+        for (int i = 0; i < all.size(); i++) {
+            Ingredient ingredient = all.get(i);
+            if (ingredient.isEmpty()) continue;
+            JsonArray items = new JsonArray();
+            Set<String> seen = new HashSet<>();
+            for (ItemStack item : ingredient.getItems()) {
+                ResourceLocation itemId = BuiltInRegistries.ITEM.getKey(item.getItem());
+                if (itemId == null || !seen.add(itemId.toString())) continue;
+                if (maxAlternatives > 0 && items.size() >= maxAlternatives) {
+                    truncatedAlternatives = true;
+                    continue;
+                }
+                items.add(itemId.toString());
+            }
+            if (items.size() > 0) {
+                ingredients.add(items);
+                grid[i] = ingredients.size();
+            }
+        }
+        recipeObj.add("ingredients", ingredients);
+        if (truncatedAlternatives) {
+            recipeObj.addProperty("alternatives_truncated", true);
+        }
+
+        if (recipe instanceof ShapedRecipe shaped) {
+            recipeObj.addProperty("width", shaped.getWidth());
+            recipeObj.addProperty("height", shaped.getHeight());
+            if (all.size() == shaped.getWidth() * shaped.getHeight()) {
+                JsonArray gridJson = new JsonArray();
+                for (int cell : grid) gridJson.add(cell);
+                recipeObj.add("grid", gridJson);
+            }
+        }
+        return recipeObj;
     }
 
     // -- Callback factories --
@@ -509,7 +606,14 @@ public class ClaudeAPI implements ILuaAPI {
 
             @Override
             public void onComplete(String stopReason, int inputTokens, int outputTokens) {
-                queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens);
+                onComplete(stopReason, inputTokens, outputTokens, 0, 0);
+            }
+
+            @Override
+            public void onComplete(String stopReason, int inputTokens, int outputTokens,
+                                   int cacheCreationTokens, int cacheReadTokens) {
+                queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens,
+                        cacheCreationTokens, cacheReadTokens);
                 activeRequests.remove(requestId);
             }
 
@@ -624,14 +728,21 @@ public class ClaudeAPI implements ILuaAPI {
                 return arr;
             }
 
-            JsonObject obj = new JsonObject();
+            // Sort keys so identical Lua tables always serialize to identical bytes.
+            // Prompt caching matches on the exact request prefix, and Lua table
+            // iteration order is not guaranteed to be stable.
+            TreeMap<String, Object> sorted = new TreeMap<>();
             for (Map.Entry<?, ?> entry : ((Map<Object, Object>) map).entrySet()) {
                 String key = String.valueOf(entry.getKey());
                 if (entry.getKey() instanceof Number n) {
                     double d = n.doubleValue();
                     if (d == Math.floor(d)) key = String.valueOf((long) d);
                 }
-                obj.add(key, luaValueToJson(entry.getValue(), key));
+                sorted.put(key, entry.getValue());
+            }
+            JsonObject obj = new JsonObject();
+            for (Map.Entry<String, Object> entry : sorted.entrySet()) {
+                obj.add(entry.getKey(), luaValueToJson(entry.getValue(), entry.getKey()));
             }
             return obj;
         }
