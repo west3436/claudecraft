@@ -1,6 +1,7 @@
 package com.claudecraft.channel;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -8,7 +9,6 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import com.google.gson.JsonPrimitive;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.storage.LevelResource;
 import net.neoforged.neoforge.server.ServerLifecycleHooks;
@@ -144,9 +144,13 @@ public class ChannelProcessManager {
         final Process ownedProcess;
         /** The launcher's OS start time, used to recognise it again after a restart. -1 if unknown. */
         final long rootStartMillis;
+        /** Secret the mod sends as a Bearer token on every channel server request. */
+        public final String token;
+        /** Secret other channel servers use to deliver to /incoming-message (in the registry). */
+        final String inboxToken;
 
         SessionInfo(int computerId, int port, Path sandboxDir, Path worldDir,
-                    ProcessHandle root, Process ownedProcess) {
+                    ProcessHandle root, Process ownedProcess, String token, String inboxToken) {
             this.computerId = computerId;
             this.port = port;
             this.sandboxDir = sandboxDir;
@@ -155,6 +159,8 @@ public class ChannelProcessManager {
             this.root = root;
             this.ownedProcess = ownedProcess;
             this.rootStartMillis = root.info().startInstant().map(Instant::toEpochMilli).orElse(-1L);
+            this.token = token;
+            this.inboxToken = inboxToken;
         }
 
         public long pid() {
@@ -241,8 +247,13 @@ public class ChannelProcessManager {
             // Write CLAUDE.md
             writeCLAUDEmd(sandboxDir, computerId, isTurtle, safeLabel, termWidth, termHeight);
 
+            // Per-session secrets for the channel server (see ChannelSecrets)
+            String token = ChannelSecrets.newToken();
+            String inboxToken = ChannelSecrets.newToken();
+
             // Write .mcp.json
-            writeMcpJson(sandboxDir, port, computerId, isTurtle, safeLabel, termWidth, termHeight, world);
+            writeMcpJson(sandboxDir, port, computerId, isTurtle, safeLabel, termWidth, termHeight, world,
+                    token, inboxToken);
 
             // Write .claude/settings.local.json
             writeSettings(sandboxDir);
@@ -250,7 +261,7 @@ public class ChannelProcessManager {
             ClaudeCraft.LOGGER.info("Starting Claude Code session for computer #{} on port {} in {}",
                     computerId, port, sandboxDir);
 
-            SessionInfo session = launch(world, computerId, port, sandboxDir);
+            SessionInfo session = launch(world, computerId, port, sandboxDir, token, inboxToken);
             sessions.put(computerId, session);
             session.root.onExit().thenRun(() -> onSessionExited(session));
             writeState(world.dir());
@@ -365,11 +376,12 @@ public class ChannelProcessManager {
         );
     }
 
-    private SessionInfo launch(WorldContext world, int computerId, int port, Path sandboxDir)
-            throws Exception {
+    private SessionInfo launch(WorldContext world, int computerId, int port, Path sandboxDir,
+                               String token, String inboxToken) throws Exception {
         if (IS_WINDOWS) {
             ProcessHandle root = launchWindows(world, computerId, sandboxDir);
-            return new SessionInfo(computerId, port, sandboxDir, world.dir(), root, null);
+            return new SessionInfo(computerId, port, sandboxDir, world.dir(), root, null,
+                    token, inboxToken);
         }
 
         // Linux and macOS: Claude Code needs a TTY, so run it under script(1)'s
@@ -402,7 +414,8 @@ public class ChannelProcessManager {
 
         // Keep stdin as an open pipe: script(1) forwards it to Claude Code
         Process process = pb.start();
-        return new SessionInfo(computerId, port, sandboxDir, world.dir(), process.toHandle(), process);
+        return new SessionInfo(computerId, port, sandboxDir, world.dir(), process.toHandle(), process,
+                token, inboxToken);
     }
 
     /**
@@ -469,9 +482,11 @@ public class ChannelProcessManager {
      * itself was started from inside one (for example ./gradlew runClient from
      * Claude Code). Otherwise the sandbox would inherit that session's account
      * details and its messaging socket and token. Host configuration such as
-     * CLAUDE_CONFIG_DIR is kept.
+     * CLAUDE_CONFIG_DIR is kept. The server's API-key-mode key is removed too,
+     * so neither Claude Code nor the Bun channel server it starts can read it.
      */
     private static void prepareEnvironment(Map<String, String> env) {
+        env.remove(ApiKeyProvider.ENV_VAR);
         env.keySet().removeIf(ChannelProcessManager::isParentSessionVariable);
         env.put("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
     }
@@ -707,6 +722,15 @@ public class ChannelProcessManager {
         return Path.of(System.getProperty("user.home"), ".claudecraft");
     }
 
+    /**
+     * A computer's sandbox folder in the current world, whether or not a session
+     * is running. Used for per-computer files the Lua API manages (the message
+     * allowlist).
+     */
+    public Path sandboxDir(int computerId) throws Exception {
+        return currentWorld().dir().resolve("computers").resolve(String.valueOf(computerId));
+    }
+
     // -- Labels --
 
     /**
@@ -774,9 +798,15 @@ public class ChannelProcessManager {
         }
     }
 
-    /** One computer's value in the registry. */
+    /**
+     * One computer's value in the registry: what another channel server needs to
+     * deliver a message to it. The inbox token works only on /incoming-message.
+     */
     private static JsonElement registryEntry(SessionInfo session) {
-        return new JsonPrimitive(session.port);
+        JsonObject entry = new JsonObject();
+        entry.addProperty("port", session.port);
+        entry.addProperty("inboxToken", session.inboxToken);
+        return entry;
     }
 
     /** The registry path a session's channel server reads. */
@@ -867,7 +897,7 @@ public class ChannelProcessManager {
 
     private void writeMcpJson(Path dir, int port, int computerId, boolean isTurtle,
                                String label, int termWidth, int termHeight,
-                               WorldContext world) throws Exception {
+                               WorldContext world, String token, String inboxToken) throws Exception {
         Path channelScript = ChannelResourceManager.getInstance()
                 .getChannelDir().resolve("claudecraft-channel.ts");
 
@@ -887,13 +917,21 @@ public class ChannelProcessManager {
         args.add(String.valueOf(ClaudeCraftConfig.TOOL_TIMEOUT_SECONDS.get()));
         args.add("--registry");
         args.add(registryPath(world).toString().replace("\\", "/"));
+        args.add("--allowlist");
+        args.add(dir.resolve(MessageAllowlist.FILE_NAME).toString().replace("\\", "/"));
         if (isTurtle) {
             args.add("--turtle");
         }
 
+        // Secrets go in env, not args: args are visible to other users in process listings
+        JsonObject env = new JsonObject();
+        env.addProperty(ChannelSecrets.TOKEN_ENV, token);
+        env.addProperty(ChannelSecrets.INBOX_TOKEN_ENV, inboxToken);
+
         JsonObject server = new JsonObject();
         server.addProperty("command", "bun");
         server.add("args", args);
+        server.add("env", env);
 
         JsonObject servers = new JsonObject();
         servers.add("claudecraft", server);
@@ -901,7 +939,11 @@ public class ChannelProcessManager {
         JsonObject root = new JsonObject();
         root.add("mcpServers", servers);
 
-        Files.writeString(dir.resolve(MCP_CONFIG_FILE), GSON.toJson(root));
+        // Lock the sandbox dir first so the tokens are never briefly world-readable
+        ChannelSecrets.restrictToOwner(dir);
+        Path mcpJson = dir.resolve(MCP_CONFIG_FILE);
+        Files.writeString(mcpJson, GSON.toJson(root));
+        ChannelSecrets.restrictToOwner(mcpJson);
     }
 
     /**
