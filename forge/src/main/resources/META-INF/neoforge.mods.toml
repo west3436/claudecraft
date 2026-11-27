@@ -8,21 +8,21 @@ version = "${file.jarVersion}"
 displayName = "ClaudeCraft"
 description = '''
 Puts Claude Code inside your ComputerCraft computers.
-Adds a built-in 'claude' API to all CC: Tweaked computers with streaming support and secure server-side API key storage.
+Adds a built-in 'claude' API to all CC: Tweaked computers with streaming support. In API key mode the key stays on the server (an environment variable or a file outside the world and config folders) and is never sent to clients.
 '''
 authors = "ClaudeCraft"
 
 [[dependencies.claudecraft]]
 modId = "neoforge"
 type = "required"
-versionRange = "[21.1.0,)"
+versionRange = "[21.1,21.2)"
 ordering = "NONE"
 side = "BOTH"
 
 [[dependencies.claudecraft]]
 modId = "minecraft"
 type = "required"
-versionRange = "[1.21.1,1.22)"
+versionRange = "[1.21.1,1.21.2)"
 ordering = "NONE"
 side = "BOTH"
 
