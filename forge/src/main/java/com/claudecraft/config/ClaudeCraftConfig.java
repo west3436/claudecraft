@@ -2,6 +2,8 @@ package com.claudecraft.config;
 
 import net.neoforged.neoforge.common.ModConfigSpec;
 
+import java.util.List;
+
 public class ClaudeCraftConfig {
     public static final ModConfigSpec SPEC;
 
@@ -20,6 +22,11 @@ public class ClaudeCraftConfig {
     public static final ModConfigSpec.BooleanValue ALLOW_SERVER_TOOLS;
     public static final ModConfigSpec.IntValue TOOL_TIMEOUT_SECONDS;
     public static final ModConfigSpec.ConfigValue<String> PERSONALITY;
+
+    public static final ModConfigSpec.BooleanValue ENABLE_CHANNEL_MODE;
+    public static final ModConfigSpec.IntValue MAX_CHANNEL_SESSIONS;
+    public static final ModConfigSpec.ConfigValue<List<? extends Number>> ALLOWED_COMPUTERS;
+    public static final ModConfigSpec.BooleanValue ALLOW_ALL_IN_SINGLEPLAYER;
 
     static {
         var builder = new ModConfigSpec.Builder();
@@ -71,6 +78,31 @@ public class ClaudeCraftConfig {
         PERSONALITY = builder
                 .comment("Personality prefix for the system prompt (e.g. 'You are a grumpy dwarf miner'). Empty for default behavior.")
                 .define("personality", "");
+
+        builder.pop();
+
+        builder.comment("Channel mode runs a local Claude Code session per computer on the machine hosting the world.",
+                        "Each session runs as the OS user that runs Minecraft and uses that user's Claude login and usage.",
+                        "See docs/channel-mode.md before enabling it on a multiplayer server.")
+                .push("channel");
+
+        ENABLE_CHANNEL_MODE = builder
+                .comment("Allow computers to use channel mode. Off by default. Toggle in-game with /claudecraft channel enable|disable.")
+                .define("enableChannelMode", false);
+
+        MAX_CHANNEL_SESSIONS = builder
+                .comment("Maximum number of Claude Code sessions running at once.")
+                .defineInRange("maxChannelSessions", 4, 1, 32);
+
+        ALLOWED_COMPUTERS = builder
+                .comment("Computer IDs allowed to use channel mode. Manage in-game with /claudecraft channel allow|deny <computerId>.")
+                .<Number>defineListAllowEmpty("allowedComputers", List.of(), () -> 0,
+                        o -> o instanceof Number n && n.doubleValue() == n.intValue() && n.intValue() >= 0);
+
+        ALLOW_ALL_IN_SINGLEPLAYER = builder
+                .comment("Singleplayer convenience: on a singleplayer world that is not open to LAN, let every computer",
+                        "use channel mode without being on allowedComputers. enableChannelMode must still be true.")
+                .define("allowAllInSingleplayer", false);
 
         builder.pop();
         SPEC = builder.build();

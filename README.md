@@ -22,8 +22,8 @@ Players interact with Claude through an in-game terminal — ask questions, run 
    claude
    ```
 4. Choose your connection mode:
-   - **API Key** — set your key first (see below)
-   - **Claude Code** — requires Bun and Claude Code installed on the host ([setup guide](docs/channel-mode.md))
+   - **API Key** — set your key first (see [Setting the API key](#setting-the-api-key) below)
+   - **Claude Code** — requires Bun and Claude Code installed on the host, and an operator must enable it and allow the computer with `/claudecraft channel enable` and `/claudecraft channel allow <computerId>` ([setup guide](docs/channel-mode.md))
 
 ### Setting the API key
 
@@ -45,7 +45,7 @@ If you use `setkey`, run it from the server console where you can. Chat commands
 - **GPS navigation** — turtles can navigate to coordinates with pathfinding, digging through obstacles
 - **Blueprint building** — execute multi-block builds from blueprints with relative coordinates
 - **Multi-computer messaging** — send messages between computers and turtles for coordinated automation
-- **Per-computer isolation** — each computer gets its own Claude session in channel mode
+- **Per-computer sessions** — each computer gets its own Claude Code session in channel mode, limited to the in-game tools
 - **Monitor support** — automatically uses connected monitors for a larger display
 - **Conversation history** — persistent chat history stored per computer
 - **Configurable** — choose model, max tokens, system prompt, and concurrency limits
