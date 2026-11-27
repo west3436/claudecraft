@@ -69,6 +69,7 @@ function progress.track(toolName, result)
     p.tools_used = (p.tools_used or 0) + 1
     if toolName == "turtle_dig" and result and result.success then p.blocks_mined = (p.blocks_mined or 0) + 1
     elseif toolName == "turtle_place" and result and result.success then p.blocks_placed = (p.blocks_placed or 0) + 1
+    elseif toolName == "build_structure" and result and result.placed then p.blocks_placed = (p.blocks_placed or 0) + result.placed
     elseif toolName == "write_file" and result and result.success then p.files_written = (p.files_written or 0) + 1
     elseif toolName == "run_command" then p.commands_run = (p.commands_run or 0) + 1
     elseif toolName == "turtle_move" and result and result.results then p.moves = (p.moves or 0) + (result.completed or 0)
@@ -182,7 +183,7 @@ function ui.drawBody()
 end
 
 function ui.drawMonitor()
-    if not monitor then return end
+    if not monitor or ui.monitorHold then return end
     local mW, mH = monitor.getSize()
     local mAdv = monitor.isColour and monitor.isColour() or false
     monitor.setBackgroundColour(C.bg); monitor.clear()
@@ -221,6 +222,7 @@ function ui.readInput()
     term.clearLine(); term.write("> "); term.setCursorPos(3,sH); term.setCursorBlink(true)
     local inp = read(nil, inpHist)
     term.setCursorBlink(false)
+    ui.monitorHold = nil -- resume mirroring chat after a build preview
     if inp and #inp > 0 then inpHist[#inpHist+1] = inp end
     return inp
 end
@@ -264,7 +266,36 @@ function tools.getDefs()
         d[#d+1] = {name="turtle_place", description="Place: place/placeUp/placeDown.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inspect", description="Inspect: inspect/inspectUp/inspectDown/detect*.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inventory", description="Inventory: select/getItemDetail/refuel/drop/suck/etc.", input_schema={type="object",properties={action={type="string"},slot={type="number"},count={type="number"}},required={"action"}}}
-        d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
+        local P = {x={type="number"},y={type="number"},z={type="number"}}
+        local FACE = {type="string", enum={"forward","right","back","left"}, description="Turtle facing when placing (stairs ascend toward it). Roof stairs face up-slope automatically."}
+        d[#d+1] = {name="build_structure",
+            description="Build from shape primitives and/or single blocks. COORDINATES ARE RELATIVE to the turtle's position and facing when called: x=right, y=up, z=forward; (0,0,0) is the turtle's own cell, so y=0 is its level and y=-1 the block under it. This is NOT the world/GPS frame turtle_goto uses. " ..
+                "Shapes apply in order (later ones overwrite earlier ones), then 'blocks'. Block 'air' carves cells out (doors, windows); it never digs. " ..
+                "Builds bottom-up, placing each block from above. Never digs blocks it placed; returns to the start, or parks beside the build if it can't, and reports position, facing and home. " ..
+                "Run dry_run=true first: bounding box, per-material need/have/short and a fuel estimate, without moving. A real run refuses if fuel is short and stops cleanly if it runs low. " ..
+                "Existing blocks in target cells are kept and reported unless replace=true; blocks dug while moving are reported. Blocks are item ids (e.g. minecraft:stone_bricks). Doors, beds and other 2-block items can't be placed this way.",
+            input_schema={type="object", properties={
+                shapes={type="array", description="Shape primitives, applied in order", items={type="object", properties={
+                    type={type="string", enum={"box","hollow_box","wall","line","floor","plane","cylinder","sphere","dome","roof"}, description="box, hollow_box, floor/plane, wall, line, roof use from+to (inclusive). cylinder, sphere, dome use center+radius. floor/plane is horizontal at from.y. wall runs from->to horizontally (diagonals ok), filled from.y..to.y. roof is a gable roof over the from..to footprint starting at from.y."},
+                    block={type="string", description="Item id, or 'air' to carve"},
+                    from={type="object", description="{x,y,z} corner or start", properties=P},
+                    to={type="object", description="{x,y,z} opposite corner or end", properties=P},
+                    center={type="object", description="{x,y,z}. For a cylinder, the middle of its bottom layer.", properties=P},
+                    radius={type="number"},
+                    height={type="number", description="cylinder: layers (default 1). wall: height from from.y instead of to.y."},
+                    hollow={type="boolean", description="cylinder/sphere/dome: shell only (default false, dome true)"},
+                    open={type="array", items={type="string", enum={"top","bottom","left","right","front","back"}}, description="hollow_box faces to leave out"},
+                    axis={type="string", enum={"x","z"}, description="roof ridge direction (default: the longer side)"},
+                    gable_block={type="string", description="roof: also fill the triangular gable ends with this block"},
+                    facing=FACE,
+                }, required={"type","block"}}},
+                blocks={type="array", description="Single blocks {x,y,z,block}, applied after shapes", items={type="object", properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"},facing=FACE}, required={"x","y","z","block"}}},
+                dry_run={type="boolean", description="Plan only; the turtle does not move"},
+                replace={type="boolean", description="Dig and replace existing blocks in target cells (default false)"},
+                restock_chest={type="string", enum={"back","down","up","left","right","front"}, description="Inventory next to the start position. When a material runs out the turtle goes back, refills, returns unneeded items, and resumes. Keep only build materials in it."},
+                preview={type="string", enum={"monitor","text","both"}, description="monitor: draw each layer on an attached monitor. text: ASCII layers in the result."},
+                preview_monitor={type="string", description="Monitor peripheral name (default: one that isn't mirroring the chat)"},
+            }}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
     return d
@@ -422,138 +453,14 @@ function tools._exec(name, input)
             return {error="Unknown: "..a}
         end
     elseif name == "build_structure" then
+        -- Shapes, dry run, safe routing and restock: rom/modules/main/claudecraft/build.lua
         if not turtle then return {error="Not a turtle"} end
-        local blocks = input.blocks
-        if not blocks or #blocks == 0 then return {error="No blocks in blueprint"} end
-
-        -- Position and facing state (relative to start)
-        local px, py, pz = 0, 0, 0
-        -- Facing: 0=+z(forward), 1=+x(right), 2=-z(back), 3=-x(left)
-        local face = 0
-        local dxMap = {[0]=0, [1]=1, [2]=0, [3]=-1}
-        local dzMap = {[0]=1, [1]=0, [2]=-1, [3]=0}
-
-        local function turnTo(dir)
-            dir = dir % 4
-            while face ~= dir do
-                local diff = (dir - face) % 4
-                if diff == 1 then
-                    turtle.turnRight()
-                    face = (face + 1) % 4
-                else
-                    turtle.turnLeft()
-                    face = (face + 3) % 4
-                end
-            end
-        end
-
-        local function tryForward()
-            if turtle.forward() then
-                px = px + dxMap[face]
-                pz = pz + dzMap[face]
-                return true
-            end
-            return false
-        end
-
-        local function tryUp()
-            if turtle.up() then py = py + 1; return true end
-            return false
-        end
-
-        local function tryDown()
-            if turtle.down() then py = py - 1; return true end
-            return false
-        end
-
-        local function digForward()
-            turtle.dig()
-            return tryForward()
-        end
-
-        local function digUp()
-            turtle.digUp()
-            return tryUp()
-        end
-
-        local function digDown()
-            turtle.digDown()
-            return tryDown()
-        end
-
-        local function goTo(tx, ty, tz)
-            -- Move Y first (up before horizontal to clear obstacles)
-            while py < ty do if not tryUp() then if not digUp() then return false end end end
-            while py > ty do if not tryDown() then if not digDown() then return false end end end
-            -- Move X
-            if px ~= tx then
-                if px < tx then turnTo(1) else turnTo(3) end
-                while px ~= tx do if not tryForward() then if not digForward() then return false end end end
-            end
-            -- Move Z
-            if pz ~= tz then
-                if pz < tz then turnTo(0) else turnTo(2) end
-                while pz ~= tz do if not tryForward() then if not digForward() then return false end end end
-            end
-            return true
-        end
-
-        local function findSlot(blockName)
-            for s = 1, 16 do
-                local item = turtle.getItemDetail(s)
-                if item and (item.name == blockName or item.name == "minecraft:"..blockName or "minecraft:"..item.name == blockName) then
-                    if turtle.getItemCount(s) > 0 then return s end
-                end
-            end
-            return nil
-        end
-
-        -- Sort blocks: bottom-up by Y, then serpentine X/Z for efficiency
-        table.sort(blocks, function(a, b)
-            if a.y ~= b.y then return a.y < b.y end
-            -- Serpentine: alternate Z direction per X row
-            if a.x ~= b.x then return a.x < b.x end
-            if a.x % 2 == 0 then return a.z < b.z
-            else return a.z > b.z end
-        end)
-
-        local placed = 0
-        local failed = {}
-        local missing = {}
-
-        for i, block in ipairs(blocks) do
-            local slot = findSlot(block.block)
-            if not slot then
-                missing[#missing+1] = {x=block.x, y=block.y, z=block.z, block=block.block}
-            else
-                turtle.select(slot)
-                -- Navigate to one above target and place down
-                if goTo(block.x, block.y + 1, block.z) then
-                    -- Dig down if something is in the way
-                    if turtle.detectDown() then turtle.digDown() end
-                    if turtle.placeDown() then
-                        placed = placed + 1
-                    else
-                        failed[#failed+1] = {x=block.x, y=block.y, z=block.z, reason="place failed"}
-                    end
-                else
-                    failed[#failed+1] = {x=block.x, y=block.y, z=block.z, reason="nav failed"}
-                end
-            end
-            -- Yield periodically to avoid "too long without yielding"
-            if i % 10 == 0 then os.queueEvent("bp_yield"); os.pullEvent("bp_yield") end
-        end
-
-        -- Return to origin
-        goTo(0, math.max(py, 1), 0)
-        goTo(0, 0, 0)
-        turnTo(0)
-
-        return {
-            total=#blocks, placed=placed,
-            failed=#failed > 0 and failed or nil,
-            missing=#missing > 0 and missing or nil
-        }
+        return require("claudecraft.build").handle(input, {
+            log = function(s) ui.add("  "..s, C.info); ui.drawBody() end,
+            chatMonitor = monSide,
+            -- a preview drawn on the chat mirror monitor stays up until the next prompt
+            onPreview = function(n) if n == monSide then ui.monitorHold = true end end,
+        })
     elseif name == "turtle_goto" then
         if not turtle then return {error="Not a turtle"} end
         local tx, ty, tz = input.x, input.y, input.z

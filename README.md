@@ -72,7 +72,7 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 | `turtle_inspect` | Inspect blocks around the turtle |
 | `turtle_inventory` | Manage the turtle's inventory |
 | `turtle_goto` | Navigate to GPS coordinates with pathfinding |
-| `build_structure` | Execute multi-block builds from blueprints |
+| `build_structure` | Build from shapes (box, hollow box, wall, floor, cylinder, sphere/dome, gable roof) or single blocks, in coordinates relative to the turtle. `dry_run` reports size, materials vs inventory and fuel without moving; optional restock chest and monitor preview |
 
 ## In-Game Commands
 

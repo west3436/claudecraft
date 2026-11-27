@@ -350,6 +350,35 @@ public class ClaudeAPI implements ILuaAPI {
         return GSON.toJson(response);
     }
 
+    /**
+     * Turtle helper: is a player standing in the block next to this turtle?
+     * build_structure calls this before attacking whatever blocks a move, so it
+     * hits mobs but only waits for players. Lua: claude.isPlayerBlocking(dir).
+     *
+     * @param direction "front", "back", "up" or "down"
+     * @return true if a (non-spectator) player's hitbox overlaps that block
+     */
+    @LuaFunction(mainThread = true)
+    public final boolean isPlayerBlocking(String direction) throws LuaException {
+        // Fully qualified names keep this helper self-contained (no import churn).
+        if (!(computer instanceof IComputerSystem system)) return false;
+        dan200.computercraft.api.turtle.ITurtleAccess turtle =
+                system.getComponent(dan200.computercraft.api.component.ComputerComponents.TURTLE);
+        if (turtle == null) throw new LuaException("Not a turtle");
+        net.minecraft.core.Direction dir = switch (direction) {
+            case "front", "forward" -> turtle.getDirection();
+            case "back" -> turtle.getDirection().getOpposite();
+            case "up", "top" -> net.minecraft.core.Direction.UP;
+            case "down", "bottom" -> net.minecraft.core.Direction.DOWN;
+            default -> throw new LuaException("Unknown direction: " + direction);
+        };
+        net.minecraft.core.BlockPos pos = turtle.getPosition().relative(dir);
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+                pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1);
+        return !turtle.getLevel().getEntitiesOfClass(
+                net.minecraft.world.entity.player.Player.class, box, p -> !p.isSpectator()).isEmpty();
+    }
+
     // -- Callback factories --
 
     private ClaudeBackend.StreamCallbacks createApiKeyCallbacks(String requestId) {
