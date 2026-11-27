@@ -7,7 +7,7 @@ Players interact with Claude through an in-game terminal — ask questions, run 
 ## Requirements
 
 - Minecraft 1.21.1
-- NeoForge 21.1.0+
+- NeoForge 21.1.x
 - [CC: Tweaked](https://modrinth.com/mod/cc-tweaked) 1.117.1+
 - **One** of the following:
   - An [Anthropic API key](https://console.anthropic.com/) (API Key mode), **or**
@@ -22,8 +22,19 @@ Players interact with Claude through an in-game terminal — ask questions, run 
    claude
    ```
 4. Choose your connection mode:
-   - **API Key** — set your key with `/claudecraft setkey sk-ant-...` first
+   - **API Key** — set your key first (see [Setting the API key](#setting-the-api-key) below)
    - **Claude Code** — requires Bun and Claude Code installed on the host, and an operator must enable it and allow the computer with `/claudecraft channel enable` and `/claudecraft channel allow <computerId>` ([setup guide](docs/channel-mode.md))
+
+### Setting the API key
+
+The key stays on the server and is never sent to clients. ClaudeCraft looks for it in this order:
+
+1. **The `CLAUDECRAFT_API_KEY` environment variable**, set on the server process. ClaudeCraft never writes it. `ANTHROPIC_API_KEY` is ignored on purpose: Claude Code processes spawned for Channel mode would inherit it.
+2. **The secrets file `<game dir>/claudecraft/api-key`.** `/claudecraft setkey sk-ant-...` writes it, and `/claudecraft clearkey` deletes it. The file sits outside the world save and `config/`, so it doesn't end up in world backups or shared modpack configs. ClaudeCraft makes it owner-only where the OS allows: mode `600` on Linux/macOS, an owner-only ACL on Windows.
+
+If you use `setkey`, run it from the server console where you can. Chat commands are kept in the client's command history.
+
+> **Upgrading from an older version?** Older versions stored the key as `apiKey` in `claudecraft-server.toml`, which lives in `config/` or a world's `serverconfig/` folder. NeoForge sends that file to every player who joins. On the first start after upgrading, ClaudeCraft moves the key to the secrets file, clears it from the config and from NeoForge's automatic `.bak` backups of it, and logs a warning. **Rotate that key** at [console.anthropic.com](https://console.anthropic.com/), because any player who joined before the upgrade could have read it. Check `defaultconfigs/claudecraft-server.toml` and any other copies of the config too.
 
 ## Features
 
@@ -88,9 +99,18 @@ See [docs/memory-and-atlas.md](docs/memory-and-atlas.md).
 
 | Command | Description |
 |---|---|
-| `/claudecraft setkey <key>` | Set your Anthropic API key |
+| `/claudecraft setkey <key>` | Save your Anthropic API key to the server-only secrets file |
+| `/claudecraft clearkey` | Delete the secrets file |
 | `/claudecraft model <model>` | Change the Claude model |
-| `/claudecraft status` | Show current configuration |
+| `/claudecraft status` | Show where the API key comes from (never the key), the model, and channel mode status |
+| `/claudecraft channel enable` \| `disable` | Turn channel mode on or off. Disabling stops every running session |
+| `/claudecraft channel allow <computerId>` | Let a computer use channel mode |
+| `/claudecraft channel deny <computerId>` | Remove a computer from the allowlist and stop its session |
+| `/claudecraft channel list` | Show whether channel mode is on, the session limit, and the allowed computers |
+| `/claudecraft channel sessions` | List running Claude Code sessions with status, port, PID and uptime |
+| `/claudecraft channel kill <computerId>` | Stop one computer's Claude Code session |
+
+All `/claudecraft` commands need operator level 3.
 
 ## Building from Source
 

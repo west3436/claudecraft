@@ -3,6 +3,7 @@ package com.claudecraft.api;
 import com.claudecraft.ClaudeCraft;
 import com.claudecraft.channel.ChannelAccess;
 import com.claudecraft.channel.ChannelProcessManager;
+import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
@@ -103,8 +104,7 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final boolean isApiKeyConfigured() {
-        String key = ClaudeCraftConfig.API_KEY.get();
-        return key != null && !key.isEmpty() && key.startsWith("sk-");
+        return ApiKeyProvider.isConfigured();
     }
 
     /**
@@ -359,9 +359,10 @@ public class ClaudeAPI implements ILuaAPI {
         JsonArray messagesJson = luaMapToJsonArray(messagesTable);
         request.add("messages", messagesJson);
 
-        // Convert tools Lua table to JSON array if provided (API key mode only)
+        // Convert tools Lua table to JSON array if provided (API key mode only).
+        // ToolPolicy enforces allowServerTools / enableWebAccess for every caller, not just claude.lua.
         if (toolsOpt.isPresent() && !useChannel) {
-            JsonArray toolsJson = luaMapToJsonArray(toolsOpt.get());
+            JsonArray toolsJson = ToolPolicy.apply(luaMapToJsonArray(toolsOpt.get()), computer.getID());
             request.add("tools", toolsJson);
         }
 
