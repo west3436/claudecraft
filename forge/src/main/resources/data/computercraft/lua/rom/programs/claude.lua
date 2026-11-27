@@ -87,6 +87,7 @@ local BODY_H = sH - 3 -- header + separator + input
 
 -- Monitor support
 local monitor, monSide, monW, monH = nil, nil, 0, 0
+local monStatusShown = false -- whether the monitor's bottom row holds the job status
 local function findMonitor()
     monitor, monSide, monW, monH = nil, nil, 0, 0
     for _, side in ipairs({"top","bottom","left","right","front","back"}) do
@@ -169,9 +170,7 @@ function ui.drawBody()
     if scrOff > 0 then
         term.setCursorPos(sW-2, 2); term.setTextColour(C.info); term.write("[^]")
     end
-    -- separator
-    term.setCursorPos(1, sH-1); term.setTextColour(C.sep); term.setBackgroundColour(C.bg)
-    term.clearLine(); term.write(string.rep("-", sW))
+    ui.drawSep()
 
     -- Restore cursor state
     term.setCursorPos(oldX, oldY)
@@ -195,7 +194,8 @@ function ui.drawMonitor()
     for _, e in ipairs(buf) do
         for _, l in ipairs(wrap(e.text, mW)) do ml[#ml+1] = {text=l, color=e.color} end
     end
-    local mb = mH - 1
+    local st = ui.status and ui.status() or nil
+    local mb = st and mH - 2 or mH - 1
     local ms = math.max(1, #ml - mb + 1)
     for row = 1, mb do
         local idx = ms + row - 1
@@ -205,6 +205,41 @@ function ui.drawMonitor()
             monitor.write(ml[idx].text:sub(1, mW))
         end
     end
+    monStatusShown = st ~= nil
+    if st then ui.drawMonitorStatus(st) end
+end
+
+-- Status line: the separator row (and the monitor's bottom row) shows
+-- background job progress. ui.status is set to jobs.status in main().
+ui.status = nil
+
+function ui.drawSep()
+    local oldX, oldY = term.getCursorPos()
+    local oldColor, oldBg = term.getTextColour(), term.getBackgroundColour()
+    local st = ui.status and ui.status() or nil
+    term.setCursorPos(1, sH-1); term.setBackgroundColour(C.bg); term.setTextColour(C.sep)
+    term.clearLine()
+    if st then
+        st = " "..st:sub(1, sW-6).." "
+        term.write("--"); term.setTextColour(C.info); term.write(st)
+        term.setTextColour(C.sep); term.write(string.rep("-", math.max(0, sW-2-#st)))
+    else
+        term.write(string.rep("-", sW))
+    end
+    term.setCursorPos(oldX, oldY); term.setTextColour(oldColor); term.setBackgroundColour(oldBg)
+end
+
+function ui.drawMonitorStatus(st)
+    if not monitor then return end
+    if st == nil then st = ui.status and ui.status() or nil end
+    if (st ~= nil) ~= monStatusShown then ui.drawMonitor(); return end
+    if not st then return end
+    local mW, mH = monitor.getSize()
+    local mAdv = monitor.isColour and monitor.isColour() or false
+    monitor.setCursorPos(1, mH)
+    if mAdv then monitor.setBackgroundColour(C.hdr_bg); monitor.setTextColour(C.hdr_fg) end
+    monitor.clearLine(); monitor.write((" "..st):sub(1, mW))
+    monitor.setBackgroundColour(C.bg)
 end
 
 function ui.init(title)
@@ -235,6 +270,10 @@ end
 -- TOOLS (same as standalone, executed Lua-side)
 ----------------------------------------------------------------------
 local tools = {}
+
+-- Background jobs: start_job/job_status/list_jobs/cancel_job, the job runner,
+-- and the turtle lock live in /rom/modules/main/claudecraft/jobs.lua.
+local jobs = require("claudecraft.jobs")
 
 function tools.getDefs()
     local d = {
@@ -267,10 +306,13 @@ function tools.getDefs()
         d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
+    jobs.addDefs(d)
     return d
 end
 
 function tools.exec(name, input)
+    local busy = jobs.turtleBusy(name, input) -- turtle lock while a turtle job runs
+    if busy then return busy end
     local ok, r = pcall(tools._exec, name, input)
     if not ok then return {error=tostring(r)} end
     progress.track(name, r)
@@ -278,6 +320,7 @@ function tools.exec(name, input)
 end
 
 function tools._exec(name, input)
+    if jobs.handles(name) then return jobs.exec(name, input) end
     if name == "read_file" then
         if not fs.exists(input.path) then return {error="Not found: "..input.path} end
         if fs.isDir(input.path) then return {error="Is a directory"} end
@@ -985,6 +1028,7 @@ sysPr = sysPr .. string.format(
     turtle and string.format("TURTLE. Fuel: %s/%s. ", tostring(turtle.getFuelLevel()), tostring(turtle.getFuelLimit())) or "",
     (claude.isWebAccessEnabled() and http) and "HTTP requests, " or "",
     turtle and "turtle control, " or "")
+sysPr = sysPr .. jobs.promptHint()
 
 local toolDefs = tools.getDefs()
 
@@ -1037,6 +1081,14 @@ local function main()
     else
         title = "Claude Code // "..model
     end
+    jobs.init({
+        add = function(text, kind) ui.add(text, C[kind] or C.info) end,
+        refresh = function(full)
+            if full then ui.drawBody() else ui.drawSep(); ui.drawMonitorStatus() end
+        end,
+        colors = C,
+    })
+    ui.status = jobs.status
     ui.init(title)
     ui.add("Claude Code for ComputerCraft", C.info)
     if backendMode == "channel" then
@@ -1050,6 +1102,7 @@ local function main()
 
     local msgs = hist.load() or {}
     if #msgs > 0 then ui.add("("..#msgs.." msgs loaded)", C.sep); ui.drawBody() end
+    jobs.startup() -- offer to resume jobs interrupted by a reboot/exit
 
     -- Startup task / autonomous mode: auto-send /.claude/startup file contents
     local STARTUP_FILE = "/.claude/startup"
@@ -1078,6 +1131,7 @@ local function main()
             ui.add("Mode reset. Run 'claude' again.", C.info); ui.drawBody()
             break
         end
+        if jobs.command(inp) then goto continue end
         if inp == "/help" then
             ui.add("Commands:", C.info)
             ui.add("  /clear    - Reset conversation", C.ai)
@@ -1085,6 +1139,7 @@ local function main()
             ui.add("  /stats    - Token usage & cost", C.ai)
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /jobs     - Background jobs", C.ai)
             ui.add("  /help     - This help", C.ai)
             ui.add("  exit      - Quit", C.ai)
             ui.add("Scroll: mouse wheel / PgUp/PgDn", C.ai)
@@ -1135,7 +1190,8 @@ local function main()
         end
 
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
-        msgs[#msgs+1] = {role="user", content=inp}
+        -- jobs.attachNotes prepends notes about jobs that ended since last turn
+        msgs[#msgs+1] = {role="user", content=jobs.attachNotes(inp)}
 
         if backendMode == "channel" then
             ----------------------------------------------------------------
@@ -1312,9 +1368,11 @@ local function main()
     if backendMode == "channel" then
         claude.stopChannel()
     end
+    local pausedJobs = jobs.shutdown()
 
     term.setBackgroundColour(colors.black); term.setTextColour(colors.white)
     term.clear(); term.setCursorPos(1,1); print("Session ended.")
+    if pausedJobs > 0 then print(pausedJobs.." background job(s) paused. Run 'claude' to resume.") end
 end
 
 -- Background handler for incoming inter-computer messages (channel mode only).
@@ -1358,4 +1416,4 @@ parallel.waitForAny(main, function()
             if monitor then ui.drawMonitor() end
         end
     end
-end, incomingMessageHandler)
+end, incomingMessageHandler, jobs.run) -- jobs.run: background job scheduler
