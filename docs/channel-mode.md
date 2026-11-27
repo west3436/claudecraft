@@ -225,6 +225,22 @@ Channel mode needs Bun and Claude Code installed on the server machine, and Clau
 
 Read [Security](#security) first: every player who can reach an allowed computer uses the server owner's Claude account.
 
+### Can computers send each other messages?
+
+Yes, with `send_message`, but a computer only accepts messages from computers its player has allowed. By default it accepts none. In the `claude` program on the receiving computer:
+
+- `/allow 12` accepts messages from computer #12 (several IDs at once work too: `/allow 12 13 14`)
+- `/deny 12` stops accepting them
+- `/allowlist` shows who is allowed
+
+Programs can do the same with `claude.getMessageAllowlist()` and `claude.setMessageAllowlist({12, 13})`. For two computers to talk both ways, each must allow the other.
+
+Claude treats a message from another computer as a request from a peer, not as an instruction from the player. Chains of messages are limited to 3 hops (player → A → B → C), and each sender may deliver at most 5 messages per minute to a computer. A computer that is busy with its player's request rejects messages until it is done.
+
+### Is the channel server reachable by other programs?
+
+Only by ClaudeCraft. Each session's server listens on `127.0.0.1` and requires a random per-session token that the mod generates. It rejects requests from web browsers, so a web page you have open cannot talk to it.
+
 ## Troubleshooting
 
 If something isn't working:
