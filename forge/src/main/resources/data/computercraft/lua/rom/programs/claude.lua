@@ -235,6 +235,7 @@ end
 -- TOOLS (same as standalone, executed Lua-side)
 ----------------------------------------------------------------------
 local tools = {}
+local guard = require("claudecraft.guard") -- confirm mode + hard limits for destructive tools
 
 function tools.getDefs()
     local d = {
@@ -270,10 +271,11 @@ function tools.getDefs()
     return d
 end
 
-function tools.exec(name, input)
-    local ok, r = pcall(tools._exec, name, input)
+-- ctx: {reqId=request the caller is streaming, remote=true for another computer's message}
+function tools.exec(name, input, ctx)
+    local ok, r, blocked = pcall(guard.run, name, input, ctx, tools._exec)
     if not ok then return {error=tostring(r)} end
-    progress.track(name, r)
+    if not blocked then progress.track(name, r) end
     return r
 end
 
@@ -334,14 +336,7 @@ function tools._exec(name, input)
         srch(input.path)
         return {matches=results, count=#results, truncated=#results>=MAX}
     elseif name == "run_command" then
-        -- Block commands that could wipe the filesystem
-        local cmd = input.command:match("^%s*(%S+)")
-        if cmd == "rm" or cmd == "delete" then
-            local target = input.command:match("%s+(.+)$")
-            if target and (target:match("^/+$") or target:match("^%*") or target:match("%-r")) then
-                return {error="Blocked: destructive command. Use delete_path tool instead."}
-            end
-        end
+        -- Destructive commands are confirmed or refused by guard.run before we get here.
         local output, curY, curLine = {}, 1, ""
         local w = sW
         local fake = {}
@@ -988,6 +983,10 @@ sysPr = sysPr .. string.format(
 
 local toolDefs = tools.getDefs()
 
+-- Channel mode: Claude Code gives up on a tool call after 60s, so answer well before that.
+guard.init{ui=ui, colors=C, shell=shell, timeout=(backendMode == "channel") and 45 or 60,
+    getMonitor=function() return monitor, monSide end}
+
 -- Display helpers for tool calls/results
 local function showToolCall(name, input)
     local s = "[tool] "..name
@@ -1085,6 +1084,7 @@ local function main()
             ui.add("  /stats    - Token usage & cost", C.ai)
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /confirm  - Ask before risky tools", C.ai)
             ui.add("  /help     - This help", C.ai)
             ui.add("  exit      - Quit", C.ai)
             ui.add("Scroll: mouse wheel / PgUp/PgDn", C.ai)
@@ -1093,6 +1093,10 @@ local function main()
             ui.add("github.com/west3436/claudecraft", C.sep)
             ui.add("  /docs/channel-mode.md", C.sep)
             ui.blank(); ui.drawBody(); goto continue
+        end
+
+        if inp == "/confirm" or inp:match("^/confirm%s") then
+            guard.command(inp:sub(9)); ui.blank(); ui.drawBody(); goto continue
         end
 
         if inp == "/stats" then
@@ -1162,7 +1166,7 @@ local function main()
                         if ok2 and parsed then input = parsed end
                     end
                     showToolCall(p3, input)
-                    local r = tools.exec(p3, input)
+                    local r = tools.exec(p3, input, {reqId=reqId})
                     showToolResult(p3, r)
                     claude.sendToolResult(reqId, p2, textutils.serialiseJSON(r))
 
@@ -1289,7 +1293,7 @@ local function main()
                     local results = {}
                     for _, tc in ipairs(toolCalls) do
                         showToolCall(tc.name, tc.input)
-                        local r = tools.exec(tc.name, tc.input)
+                        local r = tools.exec(tc.name, tc.input, {reqId=reqId})
                         showToolResult(tc.name, r)
                         results[#results+1] = {type="tool_result", tool_use_id=tc.id, content=textutils.serialiseJSON(r)}
                     end
@@ -1329,7 +1333,8 @@ local function incomingMessageHandler()
                 if ok2 and parsed then input = parsed end
             end
             showToolCall(p3, input)
-            local r = tools.exec(p3, input)
+            -- No player asked for this: destructive tools always need a y/n here.
+            local r = tools.exec(p3, input, {reqId=p1, remote=true})
             showToolResult(p3, r)
             claude.sendToolResult(p1, p2, textutils.serialiseJSON(r))
 
