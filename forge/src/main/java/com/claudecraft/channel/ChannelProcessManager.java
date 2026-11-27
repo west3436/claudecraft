@@ -1,6 +1,7 @@
 package com.claudecraft.channel;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -490,9 +491,11 @@ public class ChannelProcessManager {
      * itself was started from inside one (for example ./gradlew runClient from
      * Claude Code). Otherwise the sandbox would inherit that session's account
      * details and its messaging socket and token. Host configuration such as
-     * CLAUDE_CONFIG_DIR is kept.
+     * CLAUDE_CONFIG_DIR is kept. The server's API-key-mode key is removed too,
+     * so neither Claude Code nor the Bun channel server it starts can read it.
      */
     private static void prepareEnvironment(Map<String, String> env) {
+        env.remove(ApiKeyProvider.ENV_VAR);
         env.keySet().removeIf(ChannelProcessManager::isParentSessionVariable);
         env.put("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
     }

@@ -287,6 +287,8 @@ end
 ----------------------------------------------------------------------
 -- TOOLS (same as standalone, executed Lua-side)
 ----------------------------------------------------------------------
+local memory = require("claudecraft.memory") -- per-computer memory: /.claude/memory.md
+local atlas = require("claudecraft.atlas")   -- shared, world-saved base atlas
 local tools = {}
 local guard = require("claudecraft.guard") -- confirm mode + hard limits for destructive tools
 
@@ -328,6 +330,8 @@ function tools.getDefs()
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
     if logistics then for _, def in ipairs(logistics.getDefs()) do d[#d+1] = def end end
+    for _, def in ipairs(memory.toolDefs()) do d[#d+1] = def end -- remember, forget
+    for _, def in ipairs(atlas.toolDefs()) do d[#d+1] = def end  -- set/list/remove_waypoint, atlas_search
     return d
 end
 
@@ -344,11 +348,14 @@ function tools.exec(name, input, ctx)
     local ok, r, blocked = pcall(guard.run, name, input, ctx, tools._exec)
     if not ok then return {error=tostring(r)} end
     if not blocked then progress.track(name, r) end
+    if not blocked then atlas.observe(name, input, r) end -- index scan_inventory results in the base atlas
     return r
 end
 
 function tools._exec(name, input)
     if logistics and logistics.handlers[name] then return logistics.handlers[name](input) end
+    local ext = memory.exec(name, input) or atlas.exec(name, input) -- module-provided tools
+    if ext then return ext end
     if name == "read_file" then
         if not fs.exists(input.path) then return {error="Not found: "..input.path} end
         if fs.isDir(input.path) then return {error="Is a directory"} end
@@ -1051,6 +1058,7 @@ sysPr = sysPr .. string.format(
     turtle and string.format("TURTLE. Fuel: %s/%s. ", tostring(turtle.getFuelLevel()), tostring(turtle.getFuelLimit())) or "",
     (claude.isWebAccessEnabled() and http) and "HTTP requests, " or "",
     turtle and "turtle control, " or "")
+local baseSysPr = sysPr -- memory.promptSection() is appended fresh each user turn
 
 local toolDefs = tools.getDefs()
 
@@ -1187,6 +1195,7 @@ local function main()
             ui.add("  /stats    - Token usage & cost", C.ai)
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /memory   - Show memory (/memory clear)", C.ai)
             ui.add("  /confirm  - Ask before risky tools", C.ai)
             ui.add("  /help     - This help", C.ai)
             ui.add("  exit      - Quit", C.ai)
@@ -1238,8 +1247,11 @@ local function main()
             ui.blank(); ui.drawBody(); goto continue
         end
 
+        if inp == "/memory" or inp:match("^/memory%s") then memory.command(inp, ui, C); goto continue end
+
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
         msgs[#msgs+1] = {role="user", content=inp}
+        sysPr = baseSysPr .. memory.promptSection() -- reload /.claude/memory.md every turn
 
         if backendMode == "channel" then
             ----------------------------------------------------------------

@@ -3,6 +3,7 @@ package com.claudecraft.api;
 import com.claudecraft.ClaudeCraft;
 import com.claudecraft.channel.ChannelAccess;
 import com.claudecraft.channel.ChannelProcessManager;
+import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
@@ -104,8 +105,7 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final boolean isApiKeyConfigured() {
-        String key = ClaudeCraftConfig.API_KEY.get();
-        return key != null && !key.isEmpty() && key.startsWith("sk-");
+        return ApiKeyProvider.isConfigured();
     }
 
     /**
@@ -383,9 +383,10 @@ public class ClaudeAPI implements ILuaAPI {
         JsonArray messagesJson = luaMapToJsonArray(messagesTable);
         request.add("messages", messagesJson);
 
-        // Convert tools Lua table to JSON array if provided (API key mode only)
+        // Convert tools Lua table to JSON array if provided (API key mode only).
+        // ToolPolicy enforces allowServerTools / enableWebAccess for every caller, not just claude.lua.
         if (toolsOpt.isPresent() && !useChannel) {
-            JsonArray toolsJson = luaMapToJsonArray(toolsOpt.get());
+            JsonArray toolsJson = ToolPolicy.apply(luaMapToJsonArray(toolsOpt.get()), computer.getID());
             request.add("tools", toolsJson);
         }
 
@@ -603,6 +604,39 @@ public class ClaudeAPI implements ILuaAPI {
             }
         }
         return recipeObj;
+    }
+
+    // -- Shared base atlas (world-saved; logic in com.claudecraft.atlas.AtlasLua) --
+    //   claude.atlasSetWaypoint{name, x?, y?, z?, dimension?, note?, group?}  -> {waypoint, replaced, group}
+    //   claude.atlasListWaypoints{group?, filter?}                            -> {waypoints, count, total, group}
+    //   claude.atlasRemoveWaypoint(name, group?)                              -> {removed, waypoint?, group}
+    //   claude.atlasSearch(query, group?) / {query, group?, limit?}           -> {matches, totals, waypoints, ...}
+    //   claude.atlasRecordInventory{peripheral, items, size?, group?}         -> {key, exact, x, y, z, ...}
+    // Omitting x/y/z in atlasSetWaypoint uses this computer's position. Groups default to "default".
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasSetWaypoint(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.setWaypoint(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasListWaypoints(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.listWaypoints(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasRemoveWaypoint(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.removeWaypoint(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasSearch(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.search(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasRecordInventory(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.recordInventory(computer, args);
     }
 
     // -- Callback factories --
