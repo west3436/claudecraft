@@ -11,6 +11,7 @@ import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.config.ModConfig;
 import net.neoforged.fml.event.lifecycle.FMLCommonSetupEvent;
 import net.neoforged.neoforge.common.NeoForge;
+import net.neoforged.neoforge.event.server.ServerStartingEvent;
 import net.neoforged.neoforge.event.server.ServerStoppingEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +36,12 @@ public class ClaudeCraft {
         // Register the 'claude' Lua API on all CC:Tweaked computers
         ComputerCraftAPI.registerAPIFactory(ClaudeAPI::new);
         LOGGER.info("ClaudeCraft initialized - Claude API available on all computers");
+    }
+
+    @SubscribeEvent
+    public void onServerStarting(ServerStartingEvent event) {
+        // Kill Claude Code sessions this world left behind (crash or killed JVM)
+        ChannelProcessManager.getInstance().onServerStarting(event.getServer());
     }
 
     @SubscribeEvent

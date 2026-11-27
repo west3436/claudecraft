@@ -64,10 +64,13 @@ const DEFAULT_TOOL_TIMEOUT_MS = (() => {
 
 const HOME_DIR = process.env.USERPROFILE || process.env.HOME || ".";
 
-// Registry file for inter-computer messaging (written by the Java mod)
-const REGISTRY_PATH = `${HOME_DIR}/.claudecraft/channel-registry.json`;
+// Registry file for inter-computer messaging (written by the Java mod).
+// The mod passes --registry: each world has its own registry.
+const REGISTRY_PATH =
+  getArg("registry", "") || `${HOME_DIR}/.claudecraft/channel-registry.json`;
 
-// Lua tool registry for this computer (written by the Java mod on startChannel)
+// Lua tool registry for this computer (written by the Java mod on startChannel).
+// The mod always passes --tools-file; the fallback suits launch.ts sandboxes.
 const TOOLS_FILE = getArg(
   "tools-file",
   `${HOME_DIR}/.claudecraft/computers/${COMPUTER_ID}/tools.json`
