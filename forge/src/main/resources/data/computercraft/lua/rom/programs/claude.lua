@@ -35,11 +35,63 @@ end
 ----------------------------------------------------------------------
 -- TOKEN & COST TRACKING
 ----------------------------------------------------------------------
-local stats = {totalIn=0, totalOut=0, requests=0}
+-- Per-model prices live in /rom/modules/main/claudecraft/pricing.lua.
+local pricing = require("claudecraft.pricing")
 
-local function estimateCost(inp, out)
-    -- Approximate costs per million tokens (Sonnet-class pricing)
-    return (inp * 3.0 / 1000000) + (out * 15.0 / 1000000)
+-- totalIn is uncached input only; total prompt = totalIn + cacheWrite + cacheRead.
+local stats = {totalIn=0, totalOut=0, cacheWrite=0, cacheRead=0, requests=0, cost=0, uncachedCost=0}
+
+-- Record one API response's usage. Cost is priced per request (some models are
+-- tiered by prompt length). Returns that request's cost.
+function stats.record(inp, out, cw, cr)
+    inp, out, cw, cr = inp or 0, out or 0, cw or 0, cr or 0
+    stats.requests = stats.requests + 1
+    stats.totalIn = stats.totalIn + inp
+    stats.totalOut = stats.totalOut + out
+    stats.cacheWrite = stats.cacheWrite + cw
+    stats.cacheRead = stats.cacheRead + cr
+    local cost, uncached = pricing.requestCost(claude.getModel(), inp, out, cw, cr)
+    stats.cost = stats.cost + cost
+    stats.uncachedCost = stats.uncachedCost + uncached
+    return cost
+end
+
+-- One-line usage summary for a response, e.g. "(5242 in [4810 cached, 120 new] / 85 out)".
+-- "cached" is cache_read_input_tokens; it should be > 0 from the second agent round on.
+function stats.usageLine(inp, out, cw, cr)
+    inp, out, cw, cr = inp or 0, out or 0, cw or 0, cr or 0
+    local f = pricing.fmtTokens
+    local parts = {}
+    if cr > 0 then parts[#parts+1] = f(cr).." cached" end
+    if cw > 0 then parts[#parts+1] = f(cw).." new" end
+    local cache = #parts > 0 and (" ["..table.concat(parts, ", ").."]") or ""
+    return string.format("(%s in%s / %s out)", f(inp + cw + cr), cache, f(out))
+end
+
+-- Lines for the /stats command.
+function stats.report()
+    local f = pricing.fmtTokens
+    local model = claude.getModel()
+    local r = pricing.lookup(model)
+    local prompt = stats.totalIn + stats.cacheWrite + stats.cacheRead
+    local hit = prompt > 0 and math.floor(stats.cacheRead * 100 / prompt + 0.5) or 0
+    local L = {
+        "  Model: "..model,
+        string.format("  Requests:    %d", stats.requests),
+        string.format("  Input:       %s (%s uncached)", f(prompt), f(stats.totalIn)),
+        string.format("  Cache read:  %s (%d%% of input)", f(stats.cacheRead), hit),
+        string.format("  Cache write: %s", f(stats.cacheWrite)),
+        string.format("  Output:      %s", f(stats.totalOut)),
+        string.format("  Est. cost:   $%.4f", stats.cost),
+    }
+    if stats.uncachedCost > stats.cost then
+        L[#L+1] = string.format("  Cache saved: $%.4f", stats.uncachedCost - stats.cost)
+    end
+    local fr = pricing.fmtRate
+    L[#L+1] = string.format("  $/MTok in %s out %s, cache w %s r %s",
+        fr(r.input), fr(r.output), fr(r.write), fr(r.read))
+    if not r.exact then L[#L+1] = "  (unknown model, priced as "..r.id..")" end
+    return L
 end
 
 ----------------------------------------------------------------------
@@ -1101,10 +1153,7 @@ local function main()
 
         if inp == "/stats" then
             ui.add("Session Stats:", C.info)
-            ui.add(string.format("  Requests: %d", stats.requests), C.ai)
-            ui.add(string.format("  Tokens in:  %d", stats.totalIn), C.ai)
-            ui.add(string.format("  Tokens out: %d", stats.totalOut), C.ai)
-            ui.add(string.format("  Est. cost:  $%.4f", estimateCost(stats.totalIn, stats.totalOut)), C.ai)
+            for _, line in ipairs(stats.report()) do ui.add(line, C.ai) end
             ui.blank(); ui.drawBody(); goto continue
         end
 
@@ -1228,7 +1277,7 @@ local function main()
 
                 -- Collect streaming events
                 while not done do
-                    local ev, p1, p2, p3, p4 = os.pullEvent()
+                    local ev, p1, p2, p3, p4, p5, p6 = os.pullEvent()
 
                     if ev == "claude_delta" and p1 == reqId then
                         responseText = responseText .. p2
@@ -1251,17 +1300,14 @@ local function main()
                     elseif ev == "claude_done" and p1 == reqId then
                         done = true
                         term.setCursorPos(1,sH); term.clearLine()
-                        -- p2=stopReason, p3=inputTokens, p4=outputTokens
+                        -- p2=stopReason, p3=inputTokens (uncached), p4=outputTokens,
+                        -- p5=cacheCreationTokens, p6=cacheReadTokens
                         if responseText and #responseText > 0 then
                             ui.add(responseText, C.ai); ui.blank()
                         end
-                        stats.requests = stats.requests + 1
-                        if p3 and p4 then
-                            stats.totalIn = stats.totalIn + (p3 or 0)
-                            stats.totalOut = stats.totalOut + (p4 or 0)
-                        end
-                        if p3 and p4 and (p3 > 0 or p4 > 0) then
-                            ui.add(string.format("(%s in / %s out)", tostring(p3), tostring(p4)), C.sep)
+                        stats.record(p3, p4, p5, p6)
+                        if (p3 or 0) + (p4 or 0) + (p5 or 0) + (p6 or 0) > 0 then
+                            ui.add(stats.usageLine(p3, p4, p5, p6), C.sep)
                         end
                         ui.drawBody()
 

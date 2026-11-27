@@ -20,6 +20,16 @@ public interface ClaudeBackend {
         void onError(String message);
 
         /**
+         * Completion with prompt-cache usage (API key mode). {@code inputTokens} is the
+         * uncached remainder only; total prompt = input + cacheCreation + cacheRead.
+         * Defaults to the cache-unaware overload.
+         */
+        default void onComplete(String stopReason, int inputTokens, int outputTokens,
+                                int cacheCreationTokens, int cacheReadTokens) {
+            onComplete(stopReason, inputTokens, outputTokens);
+        }
+
+        /**
          * Channel mode only: Claude Code requests execution of a Minecraft tool.
          * The receiver should execute the tool and call sendToolResult().
          */
