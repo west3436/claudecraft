@@ -48,8 +48,11 @@ const IS_TURTLE = hasFlag("turtle");
 const TERM_WIDTH = parseInt(getArg("term-width", "51"), 10);
 const TERM_HEIGHT = parseInt(getArg("term-height", "19"), 10);
 
-// Registry file for inter-computer messaging (written by the Java mod)
+// Registry file for inter-computer messaging (written by the Java mod).
+// The mod passes --registry: each world has its own registry.
 const REGISTRY_PATH = (() => {
+  const explicit = getArg("registry", "");
+  if (explicit) return explicit;
   const home =
     process.env.USERPROFILE || process.env.HOME || ".";
   return `${home}/.claudecraft/channel-registry.json`;

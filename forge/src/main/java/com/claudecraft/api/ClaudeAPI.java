@@ -1,11 +1,11 @@
 package com.claudecraft.api;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.channel.ChannelAccess;
 import com.claudecraft.channel.ChannelProcessManager;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
-import dan200.computercraft.api.peripheral.IComputerAccess;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.server.MinecraftServer;
@@ -57,13 +57,16 @@ public class ClaudeAPI implements ILuaAPI {
             "required", "content", "messages", "tools", "stop_sequences", "args", "items"
     );
 
-    private final IComputerAccess computer;
+    private final IComputerSystem computer;
     private final Map<String, ClaudeBackend.StreamHandle> activeRequests = new ConcurrentHashMap<>();
 
     /** Per-computer channel backend, created when startChannel() is called. */
     private volatile ChannelBackend channelBackend;
 
-    public ClaudeAPI(IComputerAccess computer) {
+    /** The session channelBackend talks to. Checked before each use: it may have been stopped or replaced. */
+    private volatile ChannelProcessManager.SessionInfo channelSession;
+
+    public ClaudeAPI(IComputerSystem computer) {
         this.computer = computer;
     }
 
@@ -85,11 +88,7 @@ public class ClaudeAPI implements ILuaAPI {
         activeRequests.clear();
 
         // Stop channel process if running
-        if (channelBackend != null) {
-            channelBackend.shutdown();
-            ChannelProcessManager.getInstance().stopSession(computer.getID());
-            channelBackend = null;
-        }
+        closeChannel();
     }
 
     // -- Lua API Methods --
@@ -140,27 +139,51 @@ public class ClaudeAPI implements ILuaAPI {
      * Start a Claude Code channel session for this computer.
      * Spawns a channel server and Claude Code process automatically.
      *
-     * @param args Lua arguments: isTurtle (boolean), label (string), termW (int), termH (int)
+     * <p>Refused unless channel mode is enabled and this computer is on the
+     * allowlist (see {@link ChannelAccess}), or when the session cap is reached.
+     * The label is read from the computer itself; the Lua label argument is
+     * ignored.
+     *
+     * @param args Lua arguments: isTurtle (boolean), label (string, ignored), termW (int), termH (int)
      * @return {success: boolean, portOrError: number|string}
      */
     @LuaFunction
     public final Object[] startChannel(@NotNull IArguments args) throws LuaException {
         boolean isTurtle = args.optBoolean(0).orElse(false);
-        String label = args.optString(1).orElse("Computer");
         int termW = args.optInt(2).orElse(51);
         int termH = args.optInt(3).orElse(19);
 
         int computerId = computer.getID();
+
+        String refusal = ChannelAccess.refusalFor(computerId);
+        if (refusal != null) {
+            ClaudeCraft.LOGGER.info("Refused channel session for computer #{}: {}", computerId, refusal);
+            return new Object[]{false, refusal};
+        }
+
+        // Label from the computer, not from Lua; the manager sanitizes it
+        String label = computer.getLabel();
+
+        // Drop any backend from an earlier startChannel before replacing it
+        ChannelBackend oldBackend = channelBackend;
+        channelBackend = null;
+        channelSession = null;
+        if (oldBackend != null) {
+            oldBackend.shutdown();
+        }
 
         try {
             ChannelProcessManager.SessionInfo session =
                     ChannelProcessManager.getInstance().startSession(
                             computerId, isTurtle, label, termW, termH);
 
-            channelBackend = new ChannelBackend(session.port);
+            ChannelBackend backend = new ChannelBackend(session.port);
 
             // Start a persistent global SSE listener for incoming inter-computer messages.
-            channelBackend.connectGlobalSSE(createChannelCallbacks("incoming"));
+            backend.connectGlobalSSE(createChannelCallbacks("incoming"));
+
+            channelSession = session;
+            channelBackend = backend;
 
             ClaudeCraft.LOGGER.info("Channel spawned for computer #{} on port {}",
                     computerId, session.port);
@@ -177,11 +200,11 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final void stopChannel() {
-        if (channelBackend != null) {
-            channelBackend.shutdown();
-            channelBackend = null;
+        boolean hadSession = channelSession != null;
+        closeChannel();
+        if (!hadSession) {
+            ChannelProcessManager.getInstance().stopSession(computer.getID());
         }
-        ChannelProcessManager.getInstance().stopSession(computer.getID());
     }
 
     /**
@@ -189,7 +212,43 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final boolean isChannelReady() {
-        return channelBackend != null && channelBackend.isConfigured();
+        ChannelBackend backend = channelBackend;
+        return backend != null && channelProblem() == null && backend.isConfigured();
+    }
+
+    /**
+     * Why this computer's channel can't be used right now, or null if it can.
+     * The session may have been stopped (by an operator, a crash or a restart),
+     * replaced, or channel access may have been withdrawn since it started.
+     */
+    private String channelProblem() {
+        ChannelProcessManager.SessionInfo session = channelSession;
+        if (session == null) {
+            return "No channel session. Exit and run claude again.";
+        }
+        String refusal = ChannelAccess.refusalFor(computer.getID());
+        if (refusal != null) {
+            ChannelProcessManager.getInstance().stopSession(session);
+            return refusal;
+        }
+        if (ChannelProcessManager.getInstance().getSession(computer.getID()) != session) {
+            return "This computer's Claude Code session has ended. Exit and run claude again.";
+        }
+        return null;
+    }
+
+    /** Shut down this computer's backend and stop its session. */
+    private void closeChannel() {
+        ChannelBackend backend = channelBackend;
+        ChannelProcessManager.SessionInfo session = channelSession;
+        channelBackend = null;
+        channelSession = null;
+        if (backend != null) {
+            backend.shutdown();
+        }
+        if (session != null) {
+            ChannelProcessManager.getInstance().stopSession(session);
+        }
     }
 
     /**
@@ -201,10 +260,21 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final String sendMessage(@NotNull IArguments args) throws LuaException {
-        boolean useChannel = channelBackend != null;
+        ChannelBackend backend = channelBackend;
+        boolean useChannel = backend != null;
 
         if (!useChannel && !isApiKeyConfigured()) {
             throw new LuaException("API key not configured. Use /claudecraft setkey <key>");
+        }
+
+        if (useChannel) {
+            // Report through the normal error event so the program can carry on
+            String problem = channelProblem();
+            if (problem != null) {
+                String requestId = REQUEST_ID_PREFIX + REQUEST_COUNTER.incrementAndGet();
+                queueEvent("claude_error", requestId, problem);
+                return requestId;
+            }
         }
 
         // Parse arguments from Lua tables
@@ -243,7 +313,7 @@ public class ClaudeAPI implements ILuaAPI {
         // Route to active backend
         ClaudeBackend.StreamHandle handle;
         if (useChannel) {
-            handle = channelBackend.sendMessage(request.toString(),
+            handle = backend.sendMessage(request.toString(),
                     createChannelCallbacks(requestId));
         } else {
             handle = ApiKeyBackend.getInstance().sendMessage(request.toString(),
@@ -260,7 +330,8 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final void sendToolResult(@NotNull IArguments args) throws LuaException {
-        if (channelBackend == null) {
+        ChannelBackend backend = channelBackend;
+        if (backend == null) {
             throw new LuaException("sendToolResult is only available in channel mode");
         }
 
@@ -268,7 +339,15 @@ public class ClaudeAPI implements ILuaAPI {
         String callId = args.getString(1);
         String resultJson = args.getString(2);
 
-        channelBackend.sendToolResult(callId, resultJson);
+        // Don't deliver to a port this computer's session no longer owns
+        String problem = channelProblem();
+        if (problem != null) {
+            ClaudeCraft.LOGGER.debug("Dropping tool result for computer #{}: {}",
+                    computer.getID(), problem);
+            return;
+        }
+
+        backend.sendToolResult(callId, resultJson);
     }
 
     /**
