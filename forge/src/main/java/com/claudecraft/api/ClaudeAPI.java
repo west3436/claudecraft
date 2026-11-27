@@ -26,7 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * Lua API:
  *   claude.isApiKeyConfigured()                   -> boolean
  *   claude.getModel()                             -> string
- *   claude.startChannel(isTurtle, label, w, h)    -> success, errorOrPort
+ *   claude.startChannel(isTurtle, label, w, h, toolDefs, toolTimeouts)
+ *                                                 -> success, errorOrPort
  *   claude.stopChannel()                          -> nil
  *   claude.isChannelReady()                       -> boolean
  *   claude.sendMessage(messages, tools, system)   -> requestId (string)
@@ -149,7 +150,13 @@ public class ClaudeAPI implements ILuaAPI {
      * The label is read from the computer itself; the Lua label argument is
      * ignored.
      *
-     * @param args Lua arguments: isTurtle (boolean), label (string, ignored), termW (int), termH (int)
+     * <p>{@code toolDefs} is the same table API-key mode passes to sendMessage
+     * (claude.lua's tools.getDefs()). It is the channel server's tool list, so
+     * every Lua tool is available in both modes. {@code toolTimeouts} maps tool
+     * names to timeout overrides in seconds for long-running tools.
+     *
+     * @param args Lua arguments: isTurtle (boolean), label (string, ignored), termW (int), termH (int),
+     *             toolDefs (table|nil), toolTimeouts (table|nil)
      * @return {success: boolean, portOrError: number|string}
      */
     @LuaFunction
@@ -157,6 +164,24 @@ public class ClaudeAPI implements ILuaAPI {
         boolean isTurtle = args.optBoolean(0).orElse(false);
         int termW = args.optInt(2).orElse(51);
         int termH = args.optInt(3).orElse(19);
+        JsonArray toolDefs = args.optTable(4).map(this::luaMapToJsonArray).orElseGet(JsonArray::new);
+        if (!toolDefs.isEmpty()) {
+            // Same server policy as API-key mode (http_request needs enableWebAccess).
+            // Anthropic-run server tools can't be served over MCP, so they are always dropped.
+            toolDefs = ToolPolicy.apply(toolDefs, false,
+                    ClaudeCraftConfig.ENABLE_WEB_ACCESS.get(), computer.getID());
+        }
+        JsonObject toolTimeouts = new JsonObject();
+        args.optTable(5).ifPresent(t -> {
+            JsonElement el = luaValueToJson(t, null);
+            if (el.isJsonObject()) {
+                el.getAsJsonObject().entrySet().forEach(e -> {
+                    if (e.getValue().isJsonPrimitive() && e.getValue().getAsJsonPrimitive().isNumber()) {
+                        toolTimeouts.add(e.getKey(), e.getValue());
+                    }
+                });
+            }
+        });
 
         int computerId = computer.getID();
 
@@ -164,6 +189,11 @@ public class ClaudeAPI implements ILuaAPI {
         if (refusal != null) {
             ClaudeCraft.LOGGER.info("Refused channel session for computer #{}: {}", computerId, refusal);
             return new Object[]{false, refusal};
+        }
+
+        if (toolDefs.isEmpty()) {
+            ClaudeCraft.LOGGER.warn("startChannel for computer #{} got no tool defs; "
+                    + "only reply/send_message will be available", computerId);
         }
 
         // Label from the computer, not from Lua; the manager sanitizes it
@@ -180,7 +210,7 @@ public class ClaudeAPI implements ILuaAPI {
         try {
             ChannelProcessManager.SessionInfo session =
                     ChannelProcessManager.getInstance().startSession(
-                            computerId, isTurtle, label, termW, termH);
+                            computerId, isTurtle, label, termW, termH, toolDefs, toolTimeouts);
 
             ChannelBackend backend = new ChannelBackend(session.port, session.token, computerId);
 

@@ -115,6 +115,8 @@ When you select Channel mode on a CC:Tweaked computer:
 
 Each computer has its own Claude Code session, sandbox folder and port. The computer's label is read by the mod itself, stripped of line breaks and control characters, and shortened to 32 characters before it goes into any generated file.
 
+Channel mode offers the same tools as API key mode. The in-game `claude` program passes its tool list (`tools.getDefs()` in `claude.lua`) to the mod, which writes it to `tools.json` in the sandbox, and the channel server serves it to Claude Code. The system prompt (your `personality` and `systemPromptPrefix` config) goes with the first message and again whenever it changes. Tools time out after `toolTimeoutSeconds`. Long tools such as `build_structure` and `turtle_goto` get more time.
+
 ### Session lifecycle
 
 - The mod tracks each session by the process ID of its launcher (the console window on Windows, `script` elsewhere) and kills that whole process tree when the session stops.
@@ -195,7 +197,7 @@ Yes. Each computer independently chooses its mode. One computer can use API key 
   - `channel-registry.json`: which port each computer's channel server uses (for `send_message`)
   - `sessions.json`: each session's process ID, used to clean up after a crash
 - Per-computer sandboxes: `~/.claudecraft/worlds/<world>/computers/<id>/`
-- Each sandbox contains: `CLAUDE.md`, `.mcp.json`, `.claude/settings.local.json`, and on Windows `launch-claude.bat`
+- Each sandbox contains: `CLAUDE.md`, `.mcp.json`, `tools.json` (the computer's tool list), `.claude/settings.local.json`, and on Windows `launch-claude.bat`
 
 Older versions used `~/.claudecraft/computers/<id>/`, shared by every world. Those folders are no longer used and can be deleted. After upgrading, each computer starts in a new sandbox folder, so Claude Code asks for trust again.
 
