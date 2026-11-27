@@ -37,7 +37,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   "claude_delta"      requestId, text
  *   "claude_tool_start" requestId, toolId, toolName
  *   "claude_tool_done"  requestId, toolId, toolName, inputJson
- *   "claude_done"       requestId, stopReason, inputTokens, outputTokens
+ *   "claude_done"       requestId, stopReason, inputTokens, outputTokens,
+ *                       cacheCreationTokens, cacheReadTokens
+ *                       (inputTokens is the uncached remainder; channel mode omits the cache fields)
  *   "claude_error"      requestId, errorMessage
  *
  *   -- Channel mode:
@@ -375,7 +377,14 @@ public class ClaudeAPI implements ILuaAPI {
 
             @Override
             public void onComplete(String stopReason, int inputTokens, int outputTokens) {
-                queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens);
+                onComplete(stopReason, inputTokens, outputTokens, 0, 0);
+            }
+
+            @Override
+            public void onComplete(String stopReason, int inputTokens, int outputTokens,
+                                   int cacheCreationTokens, int cacheReadTokens) {
+                queueEvent("claude_done", requestId, stopReason, inputTokens, outputTokens,
+                        cacheCreationTokens, cacheReadTokens);
                 activeRequests.remove(requestId);
             }
 
@@ -490,14 +499,21 @@ public class ClaudeAPI implements ILuaAPI {
                 return arr;
             }
 
-            JsonObject obj = new JsonObject();
+            // Sort keys so identical Lua tables always serialize to identical bytes.
+            // Prompt caching matches on the exact request prefix, and Lua table
+            // iteration order is not guaranteed to be stable.
+            TreeMap<String, Object> sorted = new TreeMap<>();
             for (Map.Entry<?, ?> entry : ((Map<Object, Object>) map).entrySet()) {
                 String key = String.valueOf(entry.getKey());
                 if (entry.getKey() instanceof Number n) {
                     double d = n.doubleValue();
                     if (d == Math.floor(d)) key = String.valueOf((long) d);
                 }
-                obj.add(key, luaValueToJson(entry.getValue(), key));
+                sorted.put(key, entry.getValue());
+            }
+            JsonObject obj = new JsonObject();
+            for (Map.Entry<String, Object> entry : sorted.entrySet()) {
+                obj.add(entry.getKey(), luaValueToJson(entry.getValue(), entry.getKey()));
             }
             return obj;
         }
