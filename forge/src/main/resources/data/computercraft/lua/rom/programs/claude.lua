@@ -270,6 +270,14 @@ function tools.getDefs()
     return d
 end
 
+-- getDefs() is the single tool registry for both modes: channel mode gets it via
+-- claude.startChannel. Channel-mode tool timeout overrides in seconds (they only
+-- extend the toolTimeoutSeconds config). Add an entry for any long-running tool.
+tools.timeouts = {
+    build_structure = 600,
+    turtle_goto = 300,
+}
+
 function tools.exec(name, input)
     local ok, r = pcall(tools._exec, name, input)
     if not ok then return {error=tostring(r)} end
@@ -909,7 +917,8 @@ if backendMode == "channel" then
     local ok, portOrErr = claude.startChannel(
         turtle ~= nil,
         os.getComputerLabel() or "Computer",
-        sW, sH
+        sW, sH,
+        tools.getDefs(), tools.timeouts
     )
 
     if not ok then

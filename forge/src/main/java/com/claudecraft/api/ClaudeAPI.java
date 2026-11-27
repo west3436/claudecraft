@@ -25,7 +25,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * Lua API:
  *   claude.isApiKeyConfigured()                   -> boolean
  *   claude.getModel()                             -> string
- *   claude.startChannel(isTurtle, label, w, h)    -> success, errorOrPort
+ *   claude.startChannel(isTurtle, label, w, h, toolDefs, toolTimeouts)
+ *                                                 -> success, errorOrPort
  *   claude.stopChannel()                          -> nil
  *   claude.isChannelReady()                       -> boolean
  *   claude.sendMessage(messages, tools, system)   -> requestId (string)
@@ -140,7 +141,13 @@ public class ClaudeAPI implements ILuaAPI {
      * Start a Claude Code channel session for this computer.
      * Spawns a channel server and Claude Code process automatically.
      *
-     * @param args Lua arguments: isTurtle (boolean), label (string), termW (int), termH (int)
+     * <p>{@code toolDefs} is the same table API-key mode passes to sendMessage
+     * (claude.lua's tools.getDefs()). It is the channel server's tool list, so
+     * every Lua tool is available in both modes. {@code toolTimeouts} maps tool
+     * names to timeout overrides in seconds for long-running tools.
+     *
+     * @param args Lua arguments: isTurtle (boolean), label (string), termW (int), termH (int),
+     *             toolDefs (table|nil), toolTimeouts (table|nil)
      * @return {success: boolean, portOrError: number|string}
      */
     @LuaFunction
@@ -149,13 +156,29 @@ public class ClaudeAPI implements ILuaAPI {
         String label = args.optString(1).orElse("Computer");
         int termW = args.optInt(2).orElse(51);
         int termH = args.optInt(3).orElse(19);
+        JsonArray toolDefs = args.optTable(4).map(this::luaMapToJsonArray).orElseGet(JsonArray::new);
+        JsonObject toolTimeouts = new JsonObject();
+        args.optTable(5).ifPresent(t -> {
+            JsonElement el = luaValueToJson(t, null);
+            if (el.isJsonObject()) {
+                el.getAsJsonObject().entrySet().forEach(e -> {
+                    if (e.getValue().isJsonPrimitive() && e.getValue().getAsJsonPrimitive().isNumber()) {
+                        toolTimeouts.add(e.getKey(), e.getValue());
+                    }
+                });
+            }
+        });
 
         int computerId = computer.getID();
+        if (toolDefs.isEmpty()) {
+            ClaudeCraft.LOGGER.warn("startChannel for computer #{} got no tool defs; "
+                    + "only reply/send_message will be available", computerId);
+        }
 
         try {
             ChannelProcessManager.SessionInfo session =
                     ChannelProcessManager.getInstance().startSession(
-                            computerId, isTurtle, label, termW, termH);
+                            computerId, isTurtle, label, termW, termH, toolDefs, toolTimeouts);
 
             channelBackend = new ChannelBackend(session.port);
 

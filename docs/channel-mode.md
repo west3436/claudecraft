@@ -46,6 +46,8 @@ When you select Channel mode on a CC:Tweaked computer:
 
 Each computer is fully isolated — its own Claude Code session, sandbox directory, and port.
 
+Channel mode offers the same tools as API key mode. The in-game `claude` program passes its tool list (`tools.getDefs()` in `claude.lua`) to the mod, which writes it to `tools.json` in the sandbox, and the channel server serves it to Claude Code. The system prompt (your `personality` and `systemPromptPrefix` config) goes with the first message and again whenever it changes. Tools time out after `toolTimeoutSeconds`. Long tools such as `build_structure` and `turtle_goto` get more time.
+
 ## Switching Modes
 
 Type `/mode` in the claude program to reset your connection mode. The next time you run `claude`, you'll see the setup screen again.
@@ -99,7 +101,7 @@ Yes. Each computer independently chooses its mode. One computer can use API key 
 
 - Channel server files: `~/.claudecraft/channel/`
 - Per-computer sandboxes: `~/.claudecraft/computers/<id>/`
-- Each sandbox contains: `CLAUDE.md`, `.mcp.json`, `.claude/settings.local.json`
+- Each sandbox contains: `CLAUDE.md`, `.mcp.json`, `tools.json`, `.claude/settings.local.json`
 
 ### Does channel mode support streaming?
 

@@ -2,11 +2,15 @@ package com.claudecraft.channel;
 
 import com.claudecraft.ClaudeCraft;
 import com.claudecraft.config.ClaudeCraftConfig;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -48,9 +52,21 @@ public class ChannelProcessManager {
      * Start a channel session for a computer. Returns the session info.
      * If a session is already running for this computer and healthy, returns it.
      * If the existing session is dead, removes it and starts a fresh one.
+     *
+     * @param toolDefs     claude.lua's tools.getDefs(), as API-key mode sends them
+     * @param toolTimeouts per-tool timeout overrides in seconds (claude.lua's tools.timeouts)
      */
     public SessionInfo startSession(int computerId, boolean isTurtle, String label,
-                                     int termWidth, int termHeight) throws Exception {
+                                     int termWidth, int termHeight,
+                                     JsonArray toolDefs, JsonObject toolTimeouts) throws Exception {
+        Path sandboxDir = Path.of(System.getProperty("user.home"),
+                ".claudecraft", "computers", String.valueOf(computerId));
+        Files.createDirectories(sandboxDir);
+
+        // Always refresh the tool registry: a reused session's channel server
+        // re-reads it and notifies Claude Code (tools/list_changed).
+        writeToolRegistry(sandboxDir, toolDefs, toolTimeouts);
+
         // Bug 3 fix: Health-check existing session before returning it.
         SessionInfo existing = sessions.get(computerId);
         if (existing != null) {
@@ -76,18 +92,13 @@ public class ChannelProcessManager {
         // Assign port
         int port = nextPort.getAndIncrement();
 
-        // Create sandbox directory
-        Path sandboxDir = Path.of(System.getProperty("user.home"),
-                ".claudecraft", "computers", String.valueOf(computerId));
-        Files.createDirectories(sandboxDir);
-
         // Write CLAUDE.md
-        writeCLAUDEmd(sandboxDir, computerId, isTurtle, label, termWidth, termHeight);
+        writeCLAUDEmd(sandboxDir, computerId, isTurtle, label, termWidth, termHeight, toolDefs);
 
         // Write .mcp.json
         writeMcpJson(sandboxDir, port, computerId, isTurtle, label, termWidth, termHeight);
 
-        // Refactor R1: Generate permissions from ToolDefinitions instead of hardcoding
+        // Permissions are generated from the Lua tool defs (see ToolDefinitions)
         Path claudeSettingsDir = sandboxDir.resolve(".claude");
         Files.createDirectories(claudeSettingsDir);
         Files.writeString(claudeSettingsDir.resolve("settings.local.json"),
@@ -98,7 +109,7 @@ public class ChannelProcessManager {
                     "deny": []
                   }
                 }
-                """.formatted(ToolDefinitions.permissionsJsonArray()));
+                """.formatted(ToolDefinitions.permissionsJsonArray(toolDefs)));
 
         // Write a launcher batch script that Claude Code runs in its own window
         Path launchScript = sandboxDir.resolve("launch-claude.bat");
@@ -239,11 +250,25 @@ public class ChannelProcessManager {
         }
     }
 
+    /**
+     * Write tools.json for the channel server. Written to a temp file and moved
+     * into place so the server never reads a half-written registry.
+     */
+    private void writeToolRegistry(Path dir, JsonArray toolDefs, JsonObject toolTimeouts)
+            throws Exception {
+        Path target = dir.resolve(ToolDefinitions.TOOLS_FILE);
+        Path tmp = dir.resolve(ToolDefinitions.TOOLS_FILE + ".tmp");
+        Files.writeString(tmp, ToolDefinitions.registryJson(toolDefs, toolTimeouts));
+        try {
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,
+                    StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
     private void writeCLAUDEmd(Path dir, int computerId, boolean isTurtle, String label,
-                                int termWidth, int termHeight) throws Exception {
-        String turtleTools = isTurtle
-                ? ",\n   turtle_move, turtle_dig, turtle_place, turtle_inspect, turtle_inventory"
-                : "";
+                                int termWidth, int termHeight, JsonArray toolDefs) throws Exception {
         String content = String.format("""
                 # ClaudeCraft Computer #%d
 
@@ -254,17 +279,18 @@ public class ChannelProcessManager {
                 1. You are IN CHARACTER at all times - you exist inside this CC:Tweaked computer.
                 2. NEVER use built-in Claude Code tools (Read, Write, Edit, Bash, Grep, Glob, Agent, etc.).
                    You do NOT have access to the host filesystem.
-                3. ONLY use the Minecraft tools provided by the ClaudeCraft channel:
-                   read_file, write_file, edit_file, list_files, find_files, search_content,
-                   run_command, delete_path, move_path, get_info, redstone, peripheral_call,
-                   send_message%s
+                3. ONLY use the Minecraft tools provided by the ClaudeCraft channel (listed below).
                 4. Your filesystem IS the CC:Tweaked virtual filesystem. Paths start with /.
                 5. NEVER use emojis - the terminal cannot display them.
                 6. NEVER use markdown formatting - this is a plain text terminal.
                 7. Be VERY concise - your terminal is %dx%d characters.
                 8. Write idiomatic CC:Tweaked Lua when writing code.
                 9. When you are done responding, ALWAYS call the reply tool.
+                10. A player message may start with a <claudecraft_system_prompt> block. It is this
+                    computer's system prompt (persona, server rules). Follow the latest one you received.
 
+                ## Tools
+                %s
                 ## Inter-Computer Messaging
                 You can send messages to other computers/turtles using send_message(computerId, message).
                 Messages from other computers arrive as "[Message from Computer #X]:" prefixed text.
@@ -276,7 +302,8 @@ public class ChannelProcessManager {
                 - Type: %s
                 - Terminal: %dx%d
                 """,
-                computerId, turtleTools, termWidth, termHeight,
+                computerId, termWidth, termHeight,
+                ToolDefinitions.claudeMdToolList(toolDefs),
                 computerId, label, isTurtle ? "Turtle" : "Computer",
                 termWidth, termHeight);
 
@@ -300,7 +327,10 @@ public class ChannelProcessManager {
         args.append("      \"--label\", \"").append(escapedLabel).append("\",\n");
         args.append("      \"--term-width\", \"").append(termWidth).append("\",\n");
         args.append("      \"--term-height\", \"").append(termHeight).append("\",\n");
-        args.append("      \"--tool-timeout\", \"").append(ClaudeCraftConfig.TOOL_TIMEOUT_SECONDS.get()).append("\"");
+        args.append("      \"--tool-timeout\", \"").append(ClaudeCraftConfig.TOOL_TIMEOUT_SECONDS.get()).append("\",\n");
+        args.append("      \"--tools-file\", \"")
+                .append(dir.resolve(ToolDefinitions.TOOLS_FILE).toString().replace("\\", "/"))
+                .append("\"");
         if (isTurtle) {
             args.append(",\n      \"--turtle\"");
         }
