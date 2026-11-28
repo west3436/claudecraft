@@ -284,7 +284,7 @@ function ui.drawSep()
 end
 
 function ui.drawMonitorStatus(st)
-    if not monitor then return end
+    if not monitor or ui.monitorHold then return end -- a build preview owns the monitor
     if st == nil then st = ui.status and ui.status() or nil end
     if (st ~= nil) ~= monStatusShown then ui.drawMonitor(); return end
     if not st then return end
@@ -414,6 +414,9 @@ tools.timeouts = {
     -- ~30 min idle limit for a silent stdio MCP call; bigger builds belong in a background job.
     build_structure = 1500,
     turtle_goto = 300,
+    -- Returns at once, but may first wait up to 45s for the player's y/n (guard prompt).
+    -- job_status/list_jobs/cancel_job never wait.
+    start_job = 90,
 }
 
 -- ctx: {reqId=request the caller is streaming, remote=true for another computer's message}
