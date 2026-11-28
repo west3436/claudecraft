@@ -4,6 +4,18 @@ A Minecraft NeoForge mod that brings Claude AI into [CC: Tweaked](https://tweake
 
 Players interact with Claude through an in-game terminal — ask questions, run tools, automate tasks, and control turtles using natural language.
 
+## Supported versions
+
+| Minecraft | Loader | Status |
+|---|---|---|
+| **1.21.1** | **NeoForge 21.1.x** | **Supported.** Download the latest `-1.21.1` release from [Releases](https://github.com/west3436/claudecraft/releases). |
+| 1.20.1 | Forge | No longer supported |
+| 1.19.2 | Forge | No longer supported |
+| 1.18.2 | Forge | No longer supported |
+| 1.16.5 | Forge | No longer supported |
+
+Only 1.21.1 gets new features and fixes. The 1.16.5, 1.18.2, 1.19.2 and 1.20.1 builds stopped at 1.2.1. Their branches and releases stay up but will not be updated, including for security fixes. In particular, they still store the API key in a server config that is sent to every player who joins (see [Setting the API key](#setting-the-api-key)). If you run one of them, move to 1.21.1.
+
 ## Requirements
 
 - Minecraft 1.21.1
