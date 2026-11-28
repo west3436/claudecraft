@@ -1146,7 +1146,12 @@ local function main()
     jobs.init({
         add = function(text, kind) ui.add(text, C[kind] or C.info) end,
         refresh = function(full)
-            if full then ui.drawBody() else ui.drawSep(); ui.drawMonitorStatus() end
+            if full then ui.drawBody()
+            else
+                ui.drawSep()
+                -- a guard y/n prompt owns the monitor's bottom row (YES/NO bar)
+                if not guard.prompting() then ui.drawMonitorStatus() end
+            end
         end,
         colors = C,
     })

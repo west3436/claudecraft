@@ -5,11 +5,19 @@
 -- job started): home is (0,0,0) facing f=0. +z is the starting facing, +x is
 -- to its right, +y is up. f: 0=+z, 1=+x, 2=-z, 3=-x (turnRight adds 1).
 --
--- Every move writes a "pending" marker (with the fuel level) to the job's
--- checkpoint before it starts and clears it once it's done, so after a reboot
--- reconcile() can tell from the fuel level whether the last move happened.
+-- Every move writes a "pending" marker (with the fuel level and time) to the
+-- job's checkpoint before it starts and clears it once it's done, so after a
+-- reboot reconcile() can tell from the fuel level whether the last move
+-- happened. Turns cost no fuel: see reconcile() for how those are decided.
 
 local M = {}
+
+-- When this computer booted (os.clock() counts from boot). Taken at load,
+-- soon after boot, so server lag barely skews it.
+local BOOT_AT = os.epoch("utc") - math.floor(os.clock() * 1000)
+-- A computer off for at most this long was rebooted (or never went off)
+-- rather than unloaded with its chunk.
+local QUICK_RESTART_MS = 10000
 
 local DX = { [0] = 0, [1] = 1, [2] = 0, [3] = -1 }
 local DZ = { [0] = 1, [1] = 0, [2] = -1, [3] = 0 }
@@ -45,7 +53,7 @@ function M.new(J, st)
     -- One attempt at a single turtle movement, checkpointed before and after.
     local function raw(op)
         local fuel = T.getFuelLevel()
-        st.pending = { op = op, fuel = type(fuel) == "number" and fuel or nil }
+        st.pending = { op = op, fuel = type(fuel) == "number" and fuel or nil, t = os.epoch("utc") }
         J.save()
         local ok, err = T[op]()
         st.pending = nil
@@ -115,7 +123,7 @@ function M.new(J, st)
     end
 
     --- At home the output chest is at (0,0,-1), so the side it shows up on
-    -- gives the real facing. Fixes the facing if a reboot mid-turn left it
+    -- gives the real facing. Fixes the facing if reconcile() guessed a turn
     -- wrong (turns, unlike moves, can't be verified from the fuel level).
     function nav.calibrate()
         if not nav.atHome() then return end
@@ -165,21 +173,30 @@ function M.new(J, st)
         return nav.goTo(0, 0, 0, reverse(st.order or "xzy"), dig)
     end
 
-    --- After a reboot: decide whether the move that was in flight completed.
+    --- After a restart: decide whether the command that was in flight ran.
     -- Moves cost 1 fuel, so a lower fuel level means it happened. Turns (and
-    -- moves with unlimited fuel) can't be checked and are assumed not done.
+    -- moves with unlimited fuel) can't be checked that way. CC:Tweaked keeps
+    -- a turtle's command queue, and runs it, while the computer is off or
+    -- rebooting; only a chunk unload or server stop drops it. So the command
+    -- ran if this computer came back quickly (a reboot) or never stopped (claude
+    -- exited), and did not if it was off for longer (unloaded with its chunk).
     function nav.reconcile()
         local p = st.pending
         if not p then return end
         st.pending = nil
-        local done = false
+        local done, how
         if MOVES[p.op] and p.fuel then
             local now = T.getFuelLevel()
             done = type(now) == "number" and now < p.fuel
+            how = done and "had completed" or "had not happened"
+        else
+            local offMs = p.t and (BOOT_AT - p.t) or math.huge
+            done = offMs <= QUICK_RESTART_MS
+            how = done and "assumed done (quick restart: the turtle kept its queue)"
+                or "assumed not done (computer was off, likely unloaded)"
         end
         if done then apply(p.op) end
-        J.log(("resume: interrupted %s %s"):format(p.op,
-            done and "had completed" or ((MOVES[p.op] and p.fuel) and "had not happened" or "assumed not done")))
+        J.log(("resume: interrupted %s %s"):format(p.op, how))
         J.save()
     end
 

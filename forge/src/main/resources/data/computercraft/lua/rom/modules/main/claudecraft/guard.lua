@@ -274,8 +274,8 @@ local function touchAnswer(mon, x, y)
 end
 
 -- Draws the question, waits for an answer, cleans up. Returns "yes", "no" or "timeout";
--- any error inside counts as "no".
-local function promptLoop(name, input, reason, ctx, hold, deadline)
+-- any error inside counts as "no". view: {title, detail, reason, timeoutText?}.
+local function promptLoop(view, ctx, hold, deadline)
     local blink = term.getCursorBlink and term.getCursorBlink() or false
     local cx, cy = term.getCursorPos()
     local fg, bg = term.getTextColour(), term.getBackgroundColour()
@@ -283,9 +283,9 @@ local function promptLoop(name, input, reason, ctx, hold, deadline)
     local timer
 
     local function loop()
-        ui.add((ctx.remote and "! Remote asks: " or "! Confirm: ") .. name, C.err)
-        ui.add("  " .. describe(name, input), C.tool)
-        ui.add("  (" .. reason .. ")", C.sep)
+        ui.add((ctx.remote and "! Remote asks: " or "! Confirm: ") .. view.title, C.err)
+        ui.add("  " .. view.detail, C.tool)
+        ui.add("  (" .. view.reason .. ")", C.sep)
         ui.add("  Allow? y / n", C.info)
         -- Keep the YES/NO bar on the monitor even when something else redraws it.
         ui.drawMonitor = function(...)
@@ -336,7 +336,8 @@ local function promptLoop(name, input, reason, ctx, hold, deadline)
         term.setTextColour(fg); term.setBackgroundColour(bg)
         term.setCursorPos(cx, cy); term.setCursorBlink(blink)
         if ans == "yes" then ui.add("  -> allowed", C.ok)
-        elseif ans == "timeout" then ui.add("  -> no answer, denied", C.err)
+        elseif ans == "timeout" then
+            ui.add("  -> " .. (view.timeoutText or "no answer, denied"), view.timeoutText and C.info or C.err)
         else ui.add("  -> denied", C.err) end
         ui.drawBody()
     end)
@@ -347,7 +348,7 @@ end
 -- Runs inside whichever coroutine asked (main loop, incoming handler, ...). parallel hands
 -- every event to every coroutine, so we only hold back the claude_* events of the caller's
 -- own request and requeue them afterwards; everything else the other coroutines already saw.
-local function ask(name, input, reason, ctx, deadline)
+local function ask(view, ctx, deadline)
     if not ui then return "no" end
     local held = {}
     local function hold(e)
@@ -361,7 +362,7 @@ local function ask(name, input, reason, ctx, deadline)
         hold(e)
     end
     busy = true
-    local ok, ans = pcall(promptLoop, name, input, reason, ctx, hold, deadline)
+    local ok, ans = pcall(promptLoop, view, ctx, hold, deadline)
     busy = false
     requeue(held)
     os.queueEvent("claudecraft_guard_free")
@@ -422,7 +423,7 @@ function M.run(name, input, ctx, exec)
 
     local reason, forced = confirmReason(name, input)
     if reason and (forced or ctx.remote or settings.confirm) then
-        local ans = ask(name, input, reason, ctx, deadline)
+        local ans = ask({ title = name, detail = describe(name, input), reason = reason }, ctx, deadline)
         if ans == "timeout" then
             return { error = "Denied: nobody at this computer confirmed the " .. name .. " call within "
                 .. timeoutSecs .. "s. Ask the player to be at the computer, or to do it themselves." }, true
@@ -463,6 +464,39 @@ end
 --- Current settings, for display or other modules.
 function M.status()
     return { confirm = settings.confirm, commands = settings.commands, commandComputer = isCommandComputer }
+end
+
+----------------------------------------------------------------------
+-- For modules that act without a tool call (claudecraft.jobs): the same prompt and
+-- the same hard limits, so there is one policy and one prompt on screen at a time.
+----------------------------------------------------------------------
+
+--- Ask the player y/n with the prompt M.run uses (one at a time; keys or monitor touch;
+-- the caller's claude_* events held back and requeued). view: {title, detail, reason,
+-- timeoutText? (shown instead of "no answer, denied")}. secs defaults to the guard timeout.
+-- Returns "yes", "no" or "timeout".
+function M.confirm(view, ctx, secs)
+    view = {
+        title = clip(view.title or "?"), detail = clip(view.detail or ""),
+        reason = clip(view.reason or "needs your OK"), timeoutText = view.timeoutText,
+    }
+    return ask(view, ctx or {}, os.epoch("utc") + (secs or timeoutSecs) * 1000)
+end
+
+--- The hard-limit refusal message for tool call `name`, or nil. Never prompts.
+function M.refusal(name, input)
+    return refusal(name, type(input) == "table" and input or {})
+end
+
+--- Why changing `path` changes what runs later (startup files, ClaudeCraft settings,
+-- the claude program), or nil.
+function M.protected(path)
+    return protectedReason(path)
+end
+
+--- True while a y/n prompt is on screen (it owns the input line and monitor bottom row).
+function M.prompting()
+    return busy
 end
 
 return M

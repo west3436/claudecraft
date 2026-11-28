@@ -22,9 +22,24 @@
 -- or, if it was started with resume_on_boot, after a visible countdown the
 -- player can stop. resume_on_boot also installs /startup/claudecraft_jobs.lua
 -- so the computer relaunches claude after a reboot.
+--
+-- GUARD (claudecraft.guard). A job runs unattended, so it never stops to ask.
+-- Instead the player decides once, at start, through the guard's own y/n prompt
+-- (so only one prompt is ever on screen, and the caller's claude_* stream
+-- events are held back, not lost):
+--   * code jobs: always asked, whatever /confirm says;
+--   * template jobs: asked when another computer requested them, or when
+--     resume_on_boot (a startup file) is wanted and confirm mode is on.
+-- While running, code jobs get the guard's hard limits without any prompt:
+-- deleting a drive root, starting claude, op commands and changes to protected
+-- paths (startup files, /.claude, the claude program) raise an error in the
+-- job. These catch mistakes; they are not a sandbox, since the player approved
+-- the code itself. Code jobs are refused on command computers while op
+-- commands are blocked. Template jobs only dig inside their declared area.
 
 local navlib = require("claudecraft.jobs_nav")
 local templates = require("claudecraft.jobs_templates")
+local guard = require("claudecraft.guard")
 
 local M = {}
 
@@ -34,7 +49,7 @@ local KILL = "claudecraft_job_kill"   -- yielded by a cancelled job at a safe po
 local WAKE = "claudecraft_job_wake"   -- makes the runner start newly spawned jobs
 local YIELD = "claudecraft_job_yield"
 local MAX_LOG, MAX_KEEP, MAX_CODE = 20, 25, 32768
-local CONFIRM_SECS = 45 -- channel mode gives up on a tool call after 60s
+local MAX_SHOWN = 200 -- code lines shown in the chat before the start prompt
 local FINAL = { done = true, failed = true, cancelled = true }
 
 local jobs = {}  -- id -> persisted record
@@ -204,41 +219,6 @@ local function flush()
     end
 end
 
---- Ask the player y/n on the input line. Returns true/false, or nil on timeout.
-local function ask(prompt, secs, default, onView)
-    local _, h = term.getSize()
-    local deadline = os.clock() + secs
-    local timer = os.startTimer(0)
-    local answer
-    while answer == nil do
-        local ev, p = os.pullEventRaw()
-        if ev == "terminate" then
-            answer = false
-        elseif ev == "timer" and p == timer then
-            local left = math.ceil(deadline - os.clock())
-            if left <= 0 then break end
-            local w = term.getSize()
-            term.setCursorPos(1, h)
-            term.setBackgroundColour(C.bg or colors.black)
-            term.setTextColour(C.tool or colors.white)
-            term.clearLine()
-            term.write((prompt .. " (" .. left .. "s)"):sub(1, w))
-            timer = os.startTimer(1)
-        elseif ev == "char" then
-            p = p:lower()
-            if p == "y" then answer = true
-            elseif p == "n" then answer = false
-            elseif p == "v" and onView then onView()
-            end
-        end
-    end
-    term.setCursorPos(1, h)
-    term.setBackgroundColour(C.bg or colors.black)
-    term.clearLine()
-    if answer == nil then return default end
-    return answer
-end
-
 ----------------------------------------------------------------------
 -- Job api handed to templates and code jobs
 ----------------------------------------------------------------------
@@ -328,6 +308,86 @@ local function makeApi(j, r)
     return api
 end
 
+-- The guard's hard limits for code jobs, applied without prompting (the player
+-- approved the job at start and may not be at the computer now).
+local function limit(why) error("Refused in background job: " .. why, 0) end
+
+local function check(p)
+    local why = guard.protected(p)
+    if why then limit(tostring(p) .. " is protected (" .. why .. ")") end
+end
+
+local function writes(mode) return type(mode) == "string" and mode:find("[wa+]") ~= nil end
+
+local function guardedFs()
+    local G = setmetatable({}, { __index = fs })
+    function G.delete(p)
+        local why = guard.refusal("delete_path", { path = p })
+        if why then limit(why) end
+        check(p)
+        return fs.delete(p)
+    end
+    function G.move(a, b) check(a); check(b); return fs.move(a, b) end
+    function G.copy(a, b) check(b); return fs.copy(a, b) end
+    function G.open(p, mode)
+        if writes(mode) then check(p) end
+        return fs.open(p, mode)
+    end
+    return G
+end
+
+local function guardedIo()
+    if type(io) ~= "table" then return nil end
+    return setmetatable({
+        open = function(p, mode)
+            if writes(mode) then check(p) end
+            return io.open(p, mode)
+        end,
+    }, { __index = io })
+end
+
+local function checkLaunch(line)
+    local why = guard.refusal("run_command", { command = line })
+    if why then limit(why) end
+end
+
+local function guardedShell()
+    if type(shell) ~= "table" then return nil end
+    local S = setmetatable({}, { __index = shell })
+    for _, k in ipairs({ "run", "execute", "openTab" }) do
+        if shell[k] then
+            S[k] = function(...)
+                local args = table.pack(...)
+                for i = 1, args.n do args[i] = tostring(args[i]) end
+                checkLaunch(table.concat(args, " ", 1, args.n))
+                return shell[k](...)
+            end
+        end
+    end
+    return S
+end
+
+local function guardedPeripheral()
+    local P = setmetatable({}, { __index = peripheral })
+    local function blocked(n) return guard.refusal("peripheral_call", { side = n }) end
+    function P.call(n, ...)
+        local why = blocked(n)
+        if why then limit(why) end
+        return peripheral.call(n, ...)
+    end
+    function P.wrap(n)
+        if blocked(n) then return nil end
+        return peripheral.wrap(n)
+    end
+    function P.find(ty, filter)
+        return peripheral.find(ty, function(n, w)
+            if blocked(n) then return false end
+            return filter == nil or filter(n, w)
+        end)
+    end
+    return P
+end
+
 local function makeEnv(api)
     local env = setmetatable({}, { __index = _ENV })
     local function out(...) api.log(...) end
@@ -336,7 +396,14 @@ local function makeEnv(api)
     env.write = function(s) api.log(s) end
     env.term = nullTerm()
     env.sleep = api.sleep
-    env.os = setmetatable({ sleep = api.sleep }, { __index = os })
+    env.fs = guardedFs()
+    env.io = guardedIo()
+    env.shell = guardedShell()
+    env.peripheral = guardedPeripheral()
+    env.os = setmetatable({
+        sleep = api.sleep,
+        run = function(e, path, ...) checkLaunch('"' .. tostring(path) .. '"'); return os.run(e, path, ...) end,
+    }, { __index = os })
     if turtle then env.turtle = api.turtle or false end
     return env
 end
@@ -534,11 +601,28 @@ local function riskSummary(code)
     return ("%d lines; uses: %s"):format(lines, #uses > 0 and table.concat(uses, ", ") or "nothing special")
 end
 
-local function startJob(input)
+-- The start-time y/n (see GUARD at the top). Returns nil when the player said yes,
+-- else the tool error to give Claude.
+local function approve(view, ctx)
+    local ans = guard.confirm(view, ctx)
+    if ans == "yes" then return nil end
+    if ans == "timeout" then
+        announce("[job] not started (no answer)", "sep")
+        return { error = "Nobody at this computer answered in time, so the job was not started." }
+    end
+    announce("[job] declined", "sep")
+    return { error = "The player declined to start this job. Don't retry it unchanged; ask them what they want.", declined = true }
+end
+
+local BOOT_NOTE = "installs a startup file so it resumes after reboots"
+
+local function startJob(input, ctx)
+    ctx = type(ctx) == "table" and ctx or {}
     local tpl, code = input.template, input.code
     if (tpl == nil) == (code == nil) then
         return { error = "Give either template (+params) or code, not both." }
     end
+    local bootHook = input.resume_on_boot == true
     local j
     if tpl then
         local T = templates[tpl]
@@ -556,6 +640,16 @@ local function startJob(input)
         end
         j = { kind = "template", template = tpl, params = params, turtle = T.turtle,
               name = input.name or T.label(params) }
+        -- Another computer asked, or Claude wants a startup file: the guard would
+        -- ask about either, so ask once here.
+        local reasons = {}
+        if ctx.remote then reasons[#reasons + 1] = "another computer asked for this turtle job" end
+        if bootHook and guard.status().confirm then reasons[#reasons + 1] = BOOT_NOTE end
+        if #reasons > 0 then
+            local err = approve({ title = "start_job " .. tpl, detail = tostring(j.name),
+                reason = table.concat(reasons, "; ") }, ctx)
+            if err then return err end
+        end
     else
         if type(code) ~= "string" or #code == 0 then return { error = "code must be a Lua program" } end
         if #code > MAX_CODE then return { error = "code is too long (max " .. MAX_CODE .. " bytes)" } end
@@ -563,31 +657,29 @@ local function startJob(input)
         if not fn then return { error = "Lua syntax error: " .. tostring(err) } end
         local summary = type(input.summary) == "string" and input.summary:gsub("%s+", " ") or ""
         if #summary == 0 then return { error = "summary is required for code jobs (shown to the player)" } end
-        if coroutine.running() ~= mainCo then
+        if ctx.remote or coroutine.running() ~= mainCo then
             return { error = "Code jobs need the player's approval at this computer, so they can't be started from an incoming message. Templates can." }
+        end
+        local gs = guard.status()
+        if gs.commandComputer and not gs.commands then
+            return { error = "Code jobs are off on this command computer while op commands are blocked. Only the player can allow them, with /confirm commands allow." }
         end
         local usesTurtle = turtle ~= nil and (code:find("turtle") or code:find("nav")) ~= nil
         local owner = usesTurtle and M.turtleOwner()
         if owner then return { error = ("The turtle is busy with job #%d. Cancel it first."):format(owner) } end
 
+        -- Show the code in the chat (scrollable) before the prompt.
         announce("[job] Claude wants to start a background program:", "tool")
-        announce("  " .. summary, "user")
-        announce("  " .. riskSummary(code) .. ". It runs with this computer's full permissions.", "sep")
-        local answer = ask("Start it? y=yes n=no v=view code", CONFIRM_SECS, nil, function()
-            local n = 0
-            for line in (code .. "\n"):gmatch("([^\n]*)\n") do
-                n = n + 1
-                pcall(hooks.add, ("%3d| %s"):format(n, line), "sep")
-            end
-            pcall(hooks.refresh, true)
-        end)
-        if answer == nil then
-            announce("[job] not started (no answer)", "sep")
-            return { error = "The player didn't answer within " .. CONFIRM_SECS .. "s, so the job was not started." }
-        elseif not answer then
-            announce("[job] declined", "sep")
-            return { error = "The player declined to start this job.", declined = true }
+        local n = 0
+        for line in (code .. "\n"):gmatch("([^\n]*)\n") do
+            n = n + 1
+            if n <= MAX_SHOWN then pcall(hooks.add, ("%3d| %s"):format(n, line), "sep") end
         end
+        if n > MAX_SHOWN then pcall(hooks.add, ("    (%d more lines not shown)"):format(n - MAX_SHOWN), "sep") end
+        announce("  " .. riskSummary(code) .. ". Full computer permissions; it won't ask again while it runs.", "sep")
+        local err = approve({ title = "start_job (Lua code)", detail = summary,
+            reason = "background program, code above" .. (bootHook and ("; " .. BOOT_NOTE) or "") }, ctx)
+        if err then return err end
         j = { kind = "code", params = type(input.params) == "table" and input.params or {},
               turtle = usesTurtle, summary = summary,
               name = type(input.name) == "string" and input.name or summary:sub(1, 24) }
@@ -597,7 +689,7 @@ local function startJob(input)
     j.name = tostring(j.name):sub(1, 40)
     j.status, j.created = "running", now()
     j.progress, j.state, j.log = {}, {}, {}
-    j.resume_on_boot = input.resume_on_boot == true
+    j.resume_on_boot = bootHook
     if code then writeFile(DIR .. "/" .. j.id .. ".lua", code) end
     persist(j)
     jobs[j.id] = j
@@ -636,10 +728,11 @@ local TOOL_NAMES = { start_job = true, job_status = true, list_jobs = true, canc
 
 function M.handles(name) return TOOL_NAMES[name] == true end
 
-function M.exec(name, input)
+--- ctx: claude.lua's tool context ({reqId, remote}), passed on to the guard prompt.
+function M.exec(name, input, ctx)
     input = type(input) == "table" and input or {}
     if name == "start_job" then
-        return startJob(input)
+        return startJob(input, ctx)
     elseif name == "job_status" then
         local j = jobs[jobId(input) or -1]
         if not j then return { error = "No job #" .. tostring(input.id) .. ". Use list_jobs." } end
@@ -668,7 +761,7 @@ function M.addDefs(d)
         or " (This computer isn't a turtle, so only code jobs are available.)"
     d[#d + 1] = { name = "start_job",
         description = "Start a background job that keeps running while the chat continues, checkpointed so it can be resumed after a reboot. Returns an id at once; a note is added to the conversation when it finishes or fails. Give EITHER template+params OR code." .. tpl
-            .. " A code job is a Lua program you write; the player must approve it (y/n) and it runs with full computer permissions. It gets a `job` table: job.params; job.state (saved across reboots - keep your progress in it); job.resumed (true when restarted after a reboot: continue from job.state); job.save(); job.progress(pct, text); job.log(text); job.sleep(s); job.yield()."
+            .. " A code job is a Lua program you write; the player must approve it (y/n) once, then it runs unattended with full computer permissions, except that deleting a drive, starting claude, op commands and writing startup files, /.claude or the claude program raise an error. It gets a `job` table: job.params; job.state (saved across reboots - keep your progress in it); job.resumed (true when restarted after a reboot: continue from job.state); job.save(); job.progress(pct, text); job.log(text); job.sleep(s); job.yield()."
             .. (turtle and " On turtles also job.nav (moves that track position relative to the start: forward/back/up/down(dig), turnLeft/turnRight/face(f), goTo(x,y,z[,order[,dig]]), goHome(), fields x y z f; +z = starting facing, +x = its right) and job.lib (unload(), ensureFuel(n), isFull())." or "")
             .. " print() goes to the job log. The program must yield often (turtle calls and job.sleep/job.yield do). Its return value is reported as the result.",
         input_schema = { type = "object", properties = {
@@ -689,6 +782,7 @@ end
 
 local READONLY_INV = { getItemDetail = true, getItemCount = true, getItemSpace = true,
     getFuelLevel = true, getFuelLimit = true, getSelectedSlot = true }
+local SELF_INV = { turtle = true, self = true }
 local TURTLE_PROGRAMS = { go = true, turn = true, excavate = true, tunnel = true, dance = true,
     refuel = true, equip = true, unequip = true, craft = true }
 
@@ -702,6 +796,12 @@ function M.turtleBusy(name, input)
     local blocked = false
     if name == "turtle_inventory" then
         blocked = not READONLY_INV[input.action or ""]
+    elseif name == "turtle_equip" then -- logistics: status is read-only
+        blocked = (input.action or "status") ~= "status"
+    elseif name == "turtle_craft" then -- logistics: check_only moves nothing
+        blocked = input.check_only ~= true
+    elseif name == "move_items" then -- logistics: 'turtle'/'self' is the turtle's own inventory
+        blocked = SELF_INV[input.from] == true or SELF_INV[input.to] == true
     elseif name ~= "turtle_inspect" and (name:find("^turtle_") or name:find("^build_") or name == "scan_area") then
         blocked = true
     elseif name == "run_command" and type(input.command) == "string" then
@@ -793,7 +893,10 @@ function M.startup()
             local where = j.progress.pct and (" at " .. j.progress.pct .. "%") or ""
             if j.resume_on_boot then
                 announce(("[job #%d] %s was interrupted%s."):format(id, j.name, where), "info")
-                if ask(("Resume job #%d now? y/n"):format(id), 10, true) then
+                local ans = guard.confirm({ title = ("resume job #%d"):format(id), detail = tostring(j.name),
+                    reason = "resume_on_boot: resumes in 10s unless you press n",
+                    timeoutText = "no answer, resuming" }, {}, 10)
+                if ans ~= "no" then
                     local ok, err = M.resume(id)
                     if not ok then announce("[job] can't resume: " .. err, "err") end
                 else
