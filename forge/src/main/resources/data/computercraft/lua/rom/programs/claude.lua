@@ -141,6 +141,7 @@ local BODY_H = sH - 3 -- header + separator + input
 
 -- Monitor support
 local monitor, monSide, monW, monH = nil, nil, 0, 0
+local monStatusShown = false -- whether the monitor's bottom row holds the job status
 local function findMonitor()
     monitor, monSide, monW, monH = nil, nil, 0, 0
     for _, side in ipairs({"top","bottom","left","right","front","back"}) do
@@ -223,9 +224,7 @@ function ui.drawBody()
     if scrOff > 0 then
         term.setCursorPos(sW-2, 2); term.setTextColour(C.info); term.write("[^]")
     end
-    -- separator
-    term.setCursorPos(1, sH-1); term.setTextColour(C.sep); term.setBackgroundColour(C.bg)
-    term.clearLine(); term.write(string.rep("-", sW))
+    ui.drawSep()
 
     -- Restore cursor state
     term.setCursorPos(oldX, oldY)
@@ -249,7 +248,8 @@ function ui.drawMonitor()
     for _, e in ipairs(buf) do
         for _, l in ipairs(wrap(e.text, mW)) do ml[#ml+1] = {text=l, color=e.color} end
     end
-    local mb = mH - 1
+    local st = ui.status and ui.status() or nil
+    local mb = st and mH - 2 or mH - 1
     local ms = math.max(1, #ml - mb + 1)
     for row = 1, mb do
         local idx = ms + row - 1
@@ -259,6 +259,41 @@ function ui.drawMonitor()
             monitor.write(ml[idx].text:sub(1, mW))
         end
     end
+    monStatusShown = st ~= nil
+    if st then ui.drawMonitorStatus(st) end
+end
+
+-- Status line: the separator row (and the monitor's bottom row) shows
+-- background job progress. ui.status is set to jobs.status in main().
+ui.status = nil
+
+function ui.drawSep()
+    local oldX, oldY = term.getCursorPos()
+    local oldColor, oldBg = term.getTextColour(), term.getBackgroundColour()
+    local st = ui.status and ui.status() or nil
+    term.setCursorPos(1, sH-1); term.setBackgroundColour(C.bg); term.setTextColour(C.sep)
+    term.clearLine()
+    if st then
+        st = " "..st:sub(1, sW-6).." "
+        term.write("--"); term.setTextColour(C.info); term.write(st)
+        term.setTextColour(C.sep); term.write(string.rep("-", math.max(0, sW-2-#st)))
+    else
+        term.write(string.rep("-", sW))
+    end
+    term.setCursorPos(oldX, oldY); term.setTextColour(oldColor); term.setBackgroundColour(oldBg)
+end
+
+function ui.drawMonitorStatus(st)
+    if not monitor or ui.monitorHold then return end -- a build preview owns the monitor
+    if st == nil then st = ui.status and ui.status() or nil end
+    if (st ~= nil) ~= monStatusShown then ui.drawMonitor(); return end
+    if not st then return end
+    local mW, mH = monitor.getSize()
+    local mAdv = monitor.isColour and monitor.isColour() or false
+    monitor.setCursorPos(1, mH)
+    if mAdv then monitor.setBackgroundColour(C.hdr_bg); monitor.setTextColour(C.hdr_fg) end
+    monitor.clearLine(); monitor.write((" "..st):sub(1, mW))
+    monitor.setBackgroundColour(C.bg)
 end
 
 function ui.init(title)
@@ -299,6 +334,10 @@ local guard = require("claudecraft.guard") -- confirm mode + hard limits for des
 local okLogistics, logistics = pcall(require, "claudecraft.logistics")
 local logisticsErr
 if not okLogistics then logisticsErr, logistics = logistics, nil end
+
+-- Background jobs: start_job/job_status/list_jobs/cancel_job, the job runner,
+-- and the turtle lock live in /rom/modules/main/claudecraft/jobs.lua.
+local jobs = require("claudecraft.jobs")
 
 function tools.getDefs()
     local d = {
@@ -363,6 +402,7 @@ function tools.getDefs()
     if logistics then for _, def in ipairs(logistics.getDefs()) do d[#d+1] = def end end
     for _, def in ipairs(memory.toolDefs()) do d[#d+1] = def end -- remember, forget
     for _, def in ipairs(atlas.toolDefs()) do d[#d+1] = def end  -- set/list/remove_waypoint, atlas_search
+    jobs.addDefs(d)
     return d
 end
 
@@ -374,18 +414,25 @@ tools.timeouts = {
     -- ~30 min idle limit for a silent stdio MCP call; bigger builds belong in a background job.
     build_structure = 1500,
     turtle_goto = 300,
+    -- Returns at once, but may first wait up to 45s for the player's y/n (guard prompt).
+    -- job_status/list_jobs/cancel_job never wait.
+    start_job = 90,
 }
 
 -- ctx: {reqId=request the caller is streaming, remote=true for another computer's message}
 function tools.exec(name, input, ctx)
-    local ok, r, blocked = pcall(guard.run, name, input, ctx, tools._exec)
+    local busy = jobs.turtleBusy(name, input) -- turtle lock while a turtle job runs
+    if busy then return busy end
+    local ok, r, blocked = pcall(guard.run, name, input, ctx,
+        function(n, i) return tools._exec(n, i, ctx) end)
     if not ok then return {error=tostring(r)} end
     if not blocked then progress.track(name, r) end
     if not blocked then atlas.observe(name, input, r) end -- index scan_inventory results in the base atlas
     return r
 end
 
-function tools._exec(name, input)
+function tools._exec(name, input, ctx)
+    if jobs.handles(name) then return jobs.exec(name, input, ctx) end
     if logistics and logistics.handlers[name] then return logistics.handlers[name](input) end
     local ext = memory.exec(name, input) or atlas.exec(name, input) -- module-provided tools
     if ext then return ext end
@@ -967,6 +1014,7 @@ sysPr = sysPr .. string.format(
     turtle and string.format("TURTLE. Fuel: %s/%s. ", tostring(turtle.getFuelLevel()), tostring(turtle.getFuelLimit())) or "",
     (claude.isWebAccessEnabled() and http) and "HTTP requests, " or "",
     turtle and "turtle control, " or "")
+sysPr = sysPr .. jobs.promptHint()
 local baseSysPr = sysPr -- memory.promptSection() is appended fresh each user turn
 
 local toolDefs = tools.getDefs()
@@ -1024,6 +1072,19 @@ local function main()
     else
         title = "Claude Code // "..model
     end
+    jobs.init({
+        add = function(text, kind) ui.add(text, C[kind] or C.info) end,
+        refresh = function(full)
+            if full then ui.drawBody()
+            else
+                ui.drawSep()
+                -- a guard y/n prompt owns the monitor's bottom row (YES/NO bar)
+                if not guard.prompting() then ui.drawMonitorStatus() end
+            end
+        end,
+        colors = C,
+    })
+    ui.status = jobs.status
     ui.init(title)
     ui.add("Claude Code for ComputerCraft", C.info)
     if backendMode == "channel" then
@@ -1038,6 +1099,7 @@ local function main()
 
     local msgs = hist.load() or {}
     if #msgs > 0 then ui.add("("..#msgs.." msgs loaded)", C.sep); ui.drawBody() end
+    jobs.startup() -- offer to resume jobs interrupted by a reboot/exit
 
     -- Startup task / autonomous mode: auto-send /.claude/startup file contents
     local STARTUP_FILE = "/.claude/startup"
@@ -1097,6 +1159,7 @@ local function main()
             ui.add("Mode reset. Run 'claude' again.", C.info); ui.drawBody()
             break
         end
+        if jobs.command(inp) then goto continue end
         if inp == "/help" then
             ui.add("Commands:", C.info)
             ui.add("  /clear    - Reset conversation", C.ai)
@@ -1104,6 +1167,7 @@ local function main()
             ui.add("  /stats    - Token usage & cost", C.ai)
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
+            ui.add("  /jobs     - Background jobs", C.ai)
             ui.add("  /memory   - Show memory (/memory clear)", C.ai)
             ui.add("  /confirm  - Ask before risky tools", C.ai)
             ui.add("  /help     - This help", C.ai)
@@ -1159,7 +1223,8 @@ local function main()
         if inp == "/memory" or inp:match("^/memory%s") then memory.command(inp, ui, C); goto continue end
 
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
-        msgs[#msgs+1] = {role="user", content=inp}
+        -- jobs.attachNotes prepends notes about jobs that ended since last turn
+        msgs[#msgs+1] = {role="user", content=jobs.attachNotes(inp)}
         sysPr = baseSysPr .. memory.promptSection() -- reload /.claude/memory.md every turn
 
         if backendMode == "channel" then
@@ -1334,9 +1399,11 @@ local function main()
     if backendMode == "channel" then
         claude.stopChannel()
     end
+    local pausedJobs = jobs.shutdown()
 
     term.setBackgroundColour(colors.black); term.setTextColour(colors.white)
     term.clear(); term.setCursorPos(1,1); print("Session ended.")
+    if pausedJobs > 0 then print(pausedJobs.." background job(s) paused. Run 'claude' to resume.") end
 end
 
 -- Background handler for incoming inter-computer messages (channel mode only).
@@ -1381,4 +1448,4 @@ parallel.waitForAny(main, function()
             if monitor then ui.drawMonitor() end
         end
     end
-end, incomingMessageHandler)
+end, incomingMessageHandler, jobs.run) -- jobs.run: background job scheduler
