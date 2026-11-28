@@ -3,6 +3,7 @@ package com.claudecraft.api;
 import com.claudecraft.ClaudeCraft;
 import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -15,6 +16,7 @@ import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -50,8 +52,10 @@ public class ApiKeyBackend implements ClaudeBackend {
     }
 
     @Override
-    public StreamHandle sendMessage(String requestJson, StreamCallbacks callbacks) {
+    public StreamHandle sendMessage(String requestJson, StreamCallbacks rawCallbacks) {
         StreamHandle handle = new StreamHandle();
+        // Lua waits for exactly one claude_done or claude_error per request
+        StreamCallbacks callbacks = new TerminalOnce(rawCallbacks);
 
         // Bug 1 fix: Atomic increment-then-check prevents race condition where
         // two threads both pass a get() check before either increments.
@@ -134,7 +138,9 @@ public class ApiKeyBackend implements ClaudeBackend {
                         return;
                     }
 
-                    parseSSEStream(response.body(), handle, callbacks);
+                    java.io.InputStream stream = response.body();
+                    handle.setStream(stream);
+                    parseSSEStream(stream, handle, callbacks, timeout);
                     return;
                 }
 
@@ -147,7 +153,12 @@ public class ApiKeyBackend implements ClaudeBackend {
                     callbacks.onError("Connection failed: " + e.getMessage());
                 }
             } finally {
+                // Never leave Lua waiting: a no-op if a terminal callback already fired
+                if (!handle.isCancelled()) {
+                    callbacks.onError("Request ended without a response.");
+                }
                 activeRequests.decrementAndGet();
+                handle.setStream(null);
                 handle.setRequestThread(null);
             }
         });
@@ -182,20 +193,34 @@ public class ApiKeyBackend implements ClaudeBackend {
 
     /**
      * Parse an Anthropic API SSE stream using the shared {@link SSEParser}.
+     * The stream is closed (and the request fails) if nothing arrives for
+     * {@code idleSeconds}; the API sends ping events while a response is pending.
      */
     private void parseSSEStream(java.io.InputStream inputStream, StreamHandle handle,
-                                 StreamCallbacks callbacks) throws Exception {
+                                 StreamCallbacks callbacks, int idleSeconds) throws Exception {
         String currentToolId = null;
         String currentToolName = null;
         StringBuilder currentToolInput = new StringBuilder();
         int inputTokens = 0;
         int cacheCreationTokens = 0;
         int cacheReadTokens = 0;
-        boolean receivedTerminalEvent = false;
 
-        try (SSEParser parser = new SSEParser(inputStream)) {
+        try (StreamWatchdog.Watch watch = StreamWatchdog.watch(inputStream, idleSeconds * 1000L);
+             SSEParser parser = new SSEParser(inputStream)) {
             SSEParser.SSEEvent event;
-            while ((event = parser.next(handle)) != null) {
+            while (true) {
+                try {
+                    event = parser.next(handle);
+                } catch (java.io.IOException e) {
+                    if (watch.stalled() && !handle.isCancelled()) {
+                        callbacks.onError("The API stream stalled (no data for "
+                                + idleSeconds + "s).");
+                        return;
+                    }
+                    throw e;
+                }
+                if (event == null) break;
+                watch.touch();
                 String eventType = event.eventType();
                 String data = event.data();
 
@@ -243,25 +268,37 @@ public class ApiKeyBackend implements ClaudeBackend {
                         }
                         case "content_block_stop" -> {
                             if (currentToolId != null) {
-                                JsonObject parsedInput;
-                                try {
-                                    parsedInput = JsonParser.parseString(
-                                            currentToolInput.toString()).getAsJsonObject();
-                                } catch (Exception e) {
-                                    parsedInput = new JsonObject();
+                                String raw = currentToolInput.toString().trim();
+                                JsonObject parsedInput = new JsonObject();
+                                String inputError = null;
+                                // An empty buffer is a tool called with no arguments
+                                if (!raw.isEmpty()) {
+                                    try {
+                                        JsonElement parsed = JsonParser.parseString(raw);
+                                        if (parsed.isJsonObject()) {
+                                            parsedInput = parsed.getAsJsonObject();
+                                        } else {
+                                            inputError = "Tool input was not a JSON object.";
+                                        }
+                                    } catch (Exception e) {
+                                        inputError = "Tool input was cut off or malformed "
+                                                + "(the response may have hit max_tokens).";
+                                    }
                                 }
                                 callbacks.onToolUseComplete(
-                                        currentToolId, currentToolName, parsedInput);
+                                        currentToolId, currentToolName, parsedInput, inputError);
                                 currentToolId = null;
                                 currentToolName = null;
                                 currentToolInput.setLength(0);
                             }
                         }
                         case "message_delta" -> {
-                            receivedTerminalEvent = true;
                             JsonObject delta = json.getAsJsonObject("delta");
-                            String stopReason = delta != null && delta.has("stop_reason")
-                                    ? delta.get("stop_reason").getAsString() : "end_turn";
+                            String stopReason = "end_turn";
+                            if (delta != null && delta.has("stop_reason")
+                                    && !delta.get("stop_reason").isJsonNull()) {
+                                stopReason = delta.get("stop_reason").getAsString();
+                            }
                             JsonObject usage = json.getAsJsonObject("usage");
                             // message_delta usage is cumulative. When it repeats the input
                             // and cache counts, take the larger of it and message_start.
@@ -279,7 +316,6 @@ public class ApiKeyBackend implements ClaudeBackend {
                             // Stream complete
                         }
                         case "error" -> {
-                            receivedTerminalEvent = true;
                             JsonObject error = json.getAsJsonObject("error");
                             String msg = error != null && error.has("message")
                                     ? error.get("message").getAsString()
@@ -288,16 +324,78 @@ public class ApiKeyBackend implements ClaudeBackend {
                         }
                     }
                 } catch (Exception e) {
-                    ClaudeCraft.LOGGER.debug("Skipping non-JSON SSE data: {}",
+                    ClaudeCraft.LOGGER.debug("Skipping unusable SSE event {} ({}): {}",
+                            eventType, e.toString(),
                             data.substring(0, Math.min(data.length(), 100)));
                 }
             }
         }
 
-        // Stream ended without a terminal event — connection was lost
-        if (!handle.isCancelled() && !receivedTerminalEvent) {
+        // Stream ended without a terminal event — connection was lost. A no-op when
+        // message_delta or an error event already ended the request.
+        if (!handle.isCancelled()) {
             callbacks.onError("Connection closed unexpectedly. The API stream " +
                     "may have been interrupted or the response exceeded limits.");
+        }
+    }
+
+    /**
+     * Delegates to the wrapped callbacks but lets only the first onComplete/onError
+     * through, so every request ends with exactly one claude_done or claude_error.
+     */
+    private static final class TerminalOnce implements StreamCallbacks {
+        private final StreamCallbacks delegate;
+        private final AtomicBoolean ended = new AtomicBoolean(false);
+
+        TerminalOnce(StreamCallbacks delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void onTextDelta(String text) {
+            if (!ended.get()) delegate.onTextDelta(text);
+        }
+
+        @Override
+        public void onToolUseStart(String id, String name) {
+            if (!ended.get()) delegate.onToolUseStart(id, name);
+        }
+
+        @Override
+        public void onToolUseDelta(String id, String partialJson) {
+            if (!ended.get()) delegate.onToolUseDelta(id, partialJson);
+        }
+
+        @Override
+        public void onToolUseComplete(String id, String name, JsonObject input) {
+            if (!ended.get()) delegate.onToolUseComplete(id, name, input);
+        }
+
+        @Override
+        public void onToolUseComplete(String id, String name, JsonObject input,
+                                      String inputError) {
+            if (!ended.get()) delegate.onToolUseComplete(id, name, input, inputError);
+        }
+
+        @Override
+        public void onComplete(String stopReason, int inputTokens, int outputTokens) {
+            if (ended.compareAndSet(false, true)) {
+                delegate.onComplete(stopReason, inputTokens, outputTokens);
+            }
+        }
+
+        @Override
+        public void onComplete(String stopReason, int inputTokens, int outputTokens,
+                               int cacheCreationTokens, int cacheReadTokens) {
+            if (ended.compareAndSet(false, true)) {
+                delegate.onComplete(stopReason, inputTokens, outputTokens,
+                        cacheCreationTokens, cacheReadTokens);
+            }
+        }
+
+        @Override
+        public void onError(String message) {
+            if (ended.compareAndSet(false, true)) delegate.onError(message);
         }
     }
 }

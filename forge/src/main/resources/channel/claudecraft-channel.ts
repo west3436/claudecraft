@@ -370,6 +370,12 @@ const NATIVE_TOOLS: ToolDef[] = [
           type: "string",
           description: "The reply text to display on the terminal",
         },
+        request_id: {
+          type: "string",
+          description:
+            "The request_id attribute of the <channel> event you are answering. " +
+            "A reply to a request that has already ended is not shown.",
+        },
       },
       required: ["text"],
     },
@@ -534,6 +540,7 @@ const systemInstructions = [
   ``,
   `Player messages arrive as <channel> events. Reply using the "reply" tool with the text you want to display.`,
   `You may call multiple Minecraft tools before replying. When you are done, ALWAYS call the reply tool.`,
+  `Pass the event's request_id attribute to reply. If a newer message arrives first, the older request has ended: answer the newer one.`,
   ``,
   `A player message may begin with a <${SYSTEM_PROMPT_TAG}> block. That is the computer's system prompt`,
   `(persona, server rules, context). Follow it for the rest of the session until a newer one arrives.`,
@@ -669,14 +676,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   // Handle reply tool
   if (name === "reply") {
-    const text = (toolArgs as { text: string }).text;
-    const reqId = activeTurnRequestId;
-    if (reqId) {
-      sendSSE({ type: "reply", text }, reqId);
-      sendSSE({ type: "done" }, reqId);
-      incomingRequestIds.delete(reqId);
-      activeTurnRequestId = null;
+    const { text, request_id } = (toolArgs ?? {}) as { text?: unknown; request_id?: unknown };
+    if (typeof text !== "string") {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ error: "text must be a string." }) }],
+        isError: true,
+      };
     }
+    // Only one request is live at a time. A reply naming another one answers a
+    // turn that a newer message already ended: don't show it as the newer turn's answer.
+    const named = typeof request_id === "string" && request_id.length > 0 ? request_id : null;
+    if (named && named !== activeTurnRequestId) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Request ${named} has already ended, so this reply was not shown.` +
+              (activeTurnRequestId ? ` Answer the newer request (${activeTurnRequestId}) instead.` : ""),
+          },
+        ],
+        isError: true,
+      };
+    }
+    const reqId = activeTurnRequestId;
+    if (!reqId) {
+      return {
+        content: [{ type: "text" as const, text: "No request is waiting for a reply; it was not shown." }],
+        isError: true,
+      };
+    }
+    sendSSE({ type: "reply", text }, reqId);
+    sendSSE({ type: "done" }, reqId);
+    incomingRequestIds.delete(reqId);
+    activeTurnRequestId = null;
     return { content: [{ type: "text" as const, text: "Reply sent." }] };
   }
 
@@ -789,9 +822,11 @@ Bun.serve({
     // --- SSE event stream ---
     if (req.method === "GET" && url.pathname === "/events") {
       const requestId = url.searchParams.get("request_id");
+      let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
 
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
+          controllerRef = controller;
           if (requestId) {
             sseConnections.set(requestId, { controller });
           } else {
@@ -816,7 +851,8 @@ Bun.serve({
               }
               pendingToolCalls.clear();
             }
-          } else {
+          } else if (globalSSE?.controller === controllerRef) {
+            // Only clear the slot if a reconnect hasn't already replaced this stream
             globalSSE = null;
           }
         },
@@ -857,6 +893,7 @@ Bun.serve({
           { type: "error", message: "New message received, previous turn cancelled." },
           activeTurnRequestId
         );
+        incomingRequestIds.delete(activeTurnRequestId);
       }
 
       await refreshToolRegistry();
