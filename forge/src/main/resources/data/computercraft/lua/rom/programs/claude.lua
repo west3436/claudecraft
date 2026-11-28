@@ -370,7 +370,9 @@ end
 -- claude.startChannel. Channel-mode tool timeout overrides in seconds (they only
 -- extend the toolTimeoutSeconds config). Add an entry for any long-running tool.
 tools.timeouts = {
-    build_structure = 600,
+    -- ~3300 moves/placements at build.lua's 0.45s/op estimate. Kept under Claude Code's
+    -- ~30 min idle limit for a silent stdio MCP call; bigger builds belong in a background job.
+    build_structure = 1500,
     turtle_goto = 300,
 }
 
