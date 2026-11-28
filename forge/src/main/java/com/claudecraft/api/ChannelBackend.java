@@ -4,8 +4,6 @@ import com.claudecraft.ClaudeCraft;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -22,8 +20,19 @@ import java.util.concurrent.TimeUnit;
  * NOT a singleton — one instance per computer session.
  */
 public class ChannelBackend implements ClaudeBackend {
-    /** Maximum time to wait for the entire SSE stream (10 minutes). */
-    private static final Duration SSE_TIMEOUT = Duration.ofMinutes(10);
+    /**
+     * Time to wait for an SSE response's headers. HttpRequest.timeout() stops
+     * applying once headers arrive, so the open stream is guarded by an idle
+     * watchdog instead: the server sends a heartbeat every 5s.
+     */
+    private static final Duration SSE_HEADERS_TIMEOUT = Duration.ofSeconds(30);
+    /** A turn's stream with no data (not even a heartbeat) for this long is dead. */
+    private static final long REQUEST_SSE_IDLE_MS = 60_000;
+    /** The global stream is reconnected after this long without data. */
+    private static final long GLOBAL_SSE_IDLE_MS = 30_000;
+    /** Consecutive failed global SSE connection attempts before giving up. */
+    private static final int GLOBAL_SSE_MAX_FAILURES = 8;
+    private static final long GLOBAL_SSE_MAX_BACKOFF_MS = 30_000;
 
     /** Maximum retries for sending tool results. */
     private static final int TOOL_RESULT_MAX_RETRIES = 2;
@@ -35,6 +44,8 @@ public class ChannelBackend implements ClaudeBackend {
     private final int computerId;
     private final HttpClient httpClient;
     private final ExecutorService executor;
+    /** Cancelled by shutdown(): stops the global SSE loop and closes its stream. */
+    private final StreamHandle globalHandle = new StreamHandle();
 
     public ChannelBackend(int port, String token, int computerId) {
         this.port = port;
@@ -135,13 +146,9 @@ public class ChannelBackend implements ClaudeBackend {
                 JsonObject respBody = JsonParser.parseString(postResp.body()).getAsJsonObject();
                 String requestId = respBody.get("requestId").getAsString();
 
-                // Bug 4 fix: Add a generous timeout to the SSE stream as a safety net.
-                // The heartbeat (every 15s) keeps the connection alive for legitimate
-                // long-running operations, but this prevents infinite hangs if the
-                // channel server dies completely without closing the connection.
                 HttpRequest sseReq = authorizedRequest("/events?request_id="
                                 + java.net.URLEncoder.encode(requestId, StandardCharsets.UTF_8))
-                        .timeout(SSE_TIMEOUT)
+                        .timeout(SSE_HEADERS_TIMEOUT)
                         .header("accept", "text/event-stream")
                         .GET()
                         .build();
@@ -150,11 +157,14 @@ public class ChannelBackend implements ClaudeBackend {
                         HttpResponse.BodyHandlers.ofInputStream());
 
                 if (sseResp.statusCode() != 200) {
+                    sseResp.body().close();
                     callbacks.onError("Channel SSE error: HTTP " + sseResp.statusCode());
                     return;
                 }
 
-                parseChannelSSE(sseResp.body(), handle, callbacks);
+                java.io.InputStream body = sseResp.body();
+                handle.setStream(body);
+                parseChannelSSE(body, handle, callbacks);
 
             } catch (InterruptedException e) {
                 if (!handle.isCancelled()) {
@@ -165,15 +175,15 @@ public class ChannelBackend implements ClaudeBackend {
                         ". Claude Code may still be starting.");
             } catch (java.net.http.HttpTimeoutException e) {
                 if (!handle.isCancelled()) {
-                    callbacks.onError("Channel stream timed out after " +
-                            SSE_TIMEOUT.toMinutes() + " minutes. The operation may still " +
-                            "be running on the channel server.");
+                    callbacks.onError("Channel server did not respond within " +
+                            SSE_HEADERS_TIMEOUT.toSeconds() + "s.");
                 }
             } catch (Exception e) {
                 if (!handle.isCancelled()) {
                     callbacks.onError("Channel connection failed: " + e.getMessage());
                 }
             } finally {
+                handle.setStream(null);
                 handle.setRequestThread(null);
             }
         });
@@ -267,76 +277,123 @@ public class ChannelBackend implements ClaudeBackend {
      * Start a persistent global SSE listener that handles events from
      * incoming inter-computer messages (tool calls, replies, done).
      * Unlike per-request SSE, this does NOT terminate on 'done' events.
+     * A dropped or silent connection is reopened with backoff until
+     * {@link #shutdown()}, or until the server keeps refusing connections.
      */
     public void connectGlobalSSE(StreamCallbacks callbacks) {
         executor.submit(() -> {
-            try {
-                HttpRequest sseReq = authorizedRequest("/events")
-                        .header("accept", "text/event-stream")
-                        .GET()
-                        .build();
+            int failures = 0;
+            long backoffMs = 1000;
+            while (!globalHandle.isCancelled()) {
+                boolean connected = false;
+                try {
+                    HttpRequest sseReq = authorizedRequest("/events")
+                            .timeout(SSE_HEADERS_TIMEOUT)
+                            .header("accept", "text/event-stream")
+                            .GET()
+                            .build();
 
-                HttpResponse<java.io.InputStream> sseResp = httpClient.send(sseReq,
-                        HttpResponse.BodyHandlers.ofInputStream());
+                    HttpResponse<java.io.InputStream> sseResp = httpClient.send(sseReq,
+                            HttpResponse.BodyHandlers.ofInputStream());
 
-                if (sseResp.statusCode() != 200) {
-                    ClaudeCraft.LOGGER.warn("Global SSE failed: HTTP {}", sseResp.statusCode());
+                    if (sseResp.statusCode() == 401) {
+                        sseResp.body().close();
+                        ClaudeCraft.LOGGER.warn("Global SSE on port {} rejected this session's "
+                                + "token; not reconnecting", port);
+                        return;
+                    }
+                    if (sseResp.statusCode() != 200) {
+                        sseResp.body().close();
+                        ClaudeCraft.LOGGER.warn("Global SSE on port {} failed: HTTP {}",
+                                port, sseResp.statusCode());
+                    } else {
+                        connected = true;
+                        readGlobalSSE(sseResp.body(), callbacks);
+                    }
+                } catch (InterruptedException e) {
+                    return;
+                } catch (Exception e) {
+                    if (!globalHandle.isCancelled()) {
+                        ClaudeCraft.LOGGER.debug("Global SSE on port {} ended: {}", port, e.toString());
+                    }
+                } finally {
+                    globalHandle.setStream(null);
+                }
+
+                if (globalHandle.isCancelled()) return;
+                if (connected) {
+                    failures = 0;
+                    backoffMs = 1000;
+                } else if (++failures >= GLOBAL_SSE_MAX_FAILURES) {
+                    ClaudeCraft.LOGGER.warn("Global SSE on port {} gave up after {} failed attempts; "
+                            + "messages from other computers will not arrive until claude restarts",
+                            port, failures);
                     return;
                 }
-
-                try (BufferedReader reader = new BufferedReader(
-                        new InputStreamReader(sseResp.body(), StandardCharsets.UTF_8))) {
-
-                    StringBuilder dataBuilder = new StringBuilder();
-                    String line;
-
-                    while ((line = reader.readLine()) != null) {
-                        if (line.startsWith("data: ")) {
-                            dataBuilder.append(line.substring(6));
-                        } else if (line.isEmpty() && dataBuilder.length() > 0) {
-                            String data = dataBuilder.toString().trim();
-                            dataBuilder.setLength(0);
-
-                            try {
-                                JsonObject event = JsonParser.parseString(data).getAsJsonObject();
-                                String type = event.has("type") ? event.get("type").getAsString() : "";
-
-                                switch (type) {
-                                    case "tool_call" -> {
-                                        String callId = event.get("callId").getAsString();
-                                        String toolName = event.get("toolName").getAsString();
-                                        String input = event.get("input").getAsString();
-                                        callbacks.onToolExecRequest(callId, toolName, input);
-                                    }
-                                    case "reply" -> {
-                                        String text = event.get("text").getAsString();
-                                        callbacks.onReply(text);
-                                    }
-                                    case "done" -> {
-                                        callbacks.onComplete("end_turn", 0, 0);
-                                    }
-                                    case "error" -> {
-                                        String msg = event.has("message")
-                                                ? event.get("message").getAsString()
-                                                : "Unknown channel error";
-                                        callbacks.onError(msg);
-                                    }
-                                }
-                            } catch (Exception e) {
-                                ClaudeCraft.LOGGER.debug("Skipping non-JSON global SSE data");
-                            }
-                        }
-                    }
+                try {
+                    Thread.sleep(backoffMs);
+                } catch (InterruptedException e) {
+                    return;
                 }
-
-            } catch (Exception e) {
-                ClaudeCraft.LOGGER.debug("Global SSE ended: {}", e.getMessage());
+                backoffMs = Math.min(backoffMs * 2, GLOBAL_SSE_MAX_BACKOFF_MS);
             }
         });
     }
 
+    /** Read one global SSE connection until it ends, fails, or goes quiet. */
+    private void readGlobalSSE(java.io.InputStream body, StreamCallbacks callbacks) throws Exception {
+        globalHandle.setStream(body);
+        try (StreamWatchdog.Watch watch = StreamWatchdog.watch(body, GLOBAL_SSE_IDLE_MS);
+             SSEParser parser = new SSEParser(body)) {
+            while (true) {
+                SSEParser.SSEEvent sse;
+                try {
+                    sse = parser.next(globalHandle);
+                } catch (java.io.IOException e) {
+                    if (watch.stalled()) {
+                        ClaudeCraft.LOGGER.info("Global SSE on port {} went quiet; reconnecting", port);
+                        return;
+                    }
+                    throw e;
+                }
+                if (sse == null) return;
+                watch.touch();
+
+                try {
+                    JsonObject event = JsonParser.parseString(sse.data()).getAsJsonObject();
+                    String type = event.has("type") ? event.get("type").getAsString() : "";
+
+                    switch (type) {
+                        case "tool_call" -> {
+                            String callId = event.get("callId").getAsString();
+                            String toolName = event.get("toolName").getAsString();
+                            String input = event.get("input").getAsString();
+                            callbacks.onToolExecRequest(callId, toolName, input);
+                        }
+                        case "reply" -> {
+                            String text = event.get("text").getAsString();
+                            callbacks.onReply(text);
+                        }
+                        case "done" -> {
+                            callbacks.onComplete("end_turn", 0, 0);
+                        }
+                        case "error" -> {
+                            String msg = event.has("message")
+                                    ? event.get("message").getAsString()
+                                    : "Unknown channel error";
+                            callbacks.onError(msg);
+                        }
+                    }
+                } catch (Exception e) {
+                    ClaudeCraft.LOGGER.debug("Skipping unusable global SSE data: {}", e.toString());
+                }
+            }
+        }
+    }
+
     @Override
     public void shutdown() {
+        globalHandle.cancel();
         executor.shutdownNow();
         try {
             executor.awaitTermination(5, TimeUnit.SECONDS);
@@ -352,9 +409,23 @@ public class ChannelBackend implements ClaudeBackend {
                                   StreamCallbacks callbacks) throws Exception {
         boolean receivedTerminalEvent = false;
 
-        try (SSEParser parser = new SSEParser(inputStream)) {
+        try (StreamWatchdog.Watch watch = StreamWatchdog.watch(inputStream, REQUEST_SSE_IDLE_MS);
+             SSEParser parser = new SSEParser(inputStream)) {
             SSEParser.SSEEvent event;
-            while ((event = parser.next(handle)) != null) {
+            while (true) {
+                try {
+                    event = parser.next(handle);
+                } catch (java.io.IOException e) {
+                    if (watch.stalled() && !handle.isCancelled()) {
+                        callbacks.onError("Lost contact with the channel server (no data for "
+                                + (REQUEST_SSE_IDLE_MS / 1000) + "s). Claude Code may have "
+                                + "stopped responding.");
+                        return;
+                    }
+                    throw e;
+                }
+                if (event == null) break;
+                watch.touch();
                 String data = event.data();
 
                 try {

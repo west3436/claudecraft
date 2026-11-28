@@ -7,17 +7,99 @@
 ----------------------------------------------------------------------
 local hist = {}
 local H_DIR, H_FILE = "/.claude", "/.claude/history.json"
-local MAX_MSG = 40
+local MAX_MSG = 40   -- trim once the conversation grows past this many messages...
+local KEEP_MSG = 24  -- ...down to about this many, so trimming (and the cache miss it causes) is rare
 
 local function ensureDir()
     if not fs.exists(H_DIR) then fs.makeDir(H_DIR) end
 end
 
+-- A user message the player typed (not a tool_result list). Only these can start a
+-- trimmed history: the API rejects a tool_result whose tool_use was cut off.
+local function isPlainUser(m)
+    if type(m) ~= "table" or m.role ~= "user" then return false end
+    if type(m.content) == "string" then return true end
+    if type(m.content) ~= "table" then return false end
+    for _, b in ipairs(m.content) do
+        if type(b) == "table" and b.type == "tool_result" then return false end
+    end
+    return true
+end
+
+local function toolUseIds(m)
+    local ids = {}
+    if type(m) == "table" and m.role == "assistant" and type(m.content) == "table" then
+        for _, b in ipairs(m.content) do
+            if type(b) == "table" and b.type == "tool_use" and b.id then ids[#ids+1] = b.id end
+        end
+    end
+    return ids
+end
+
+local function resultIds(m)
+    local set = {}
+    if type(m) == "table" and m.role == "user" and type(m.content) == "table" then
+        for _, b in ipairs(m.content) do
+            if type(b) == "table" and b.type == "tool_result" and b.tool_use_id then set[b.tool_use_id] = true end
+        end
+    end
+    return set
+end
+
+-- Trim m in place to at most `keep` messages, cutting only at a plain user message.
+function hist.trim(m, keep)
+    keep = keep or KEEP_MSG
+    if #m <= keep then return m end
+    local s = #m - keep + 1
+    while s <= #m and not isPlainUser(m[s]) do s = s + 1 end
+    if s > #m then s = #m + 1 end -- no safe cut point: drop everything
+    local n = 0
+    for i = s, #m do n = n + 1; m[n] = m[i] end
+    for i = #m, n + 1, -1 do m[i] = nil end
+    return m
+end
+
+-- Repair a history so the API accepts it: start at a plain user message, cut at the
+-- first tool_use without a matching tool_result, and end on an assistant message.
+function hist.sanitize(m)
+    local s = 1
+    while s <= #m and not isPlainUser(m[s]) do s = s + 1 end
+    local out = {}
+    local i = s
+    while i <= #m do
+        local msg = m[i]
+        if type(msg) ~= "table" or (msg.role ~= "user" and msg.role ~= "assistant") then break end
+        local ids = toolUseIds(msg)
+        if #ids > 0 then
+            local got = resultIds(m[i + 1])
+            local complete = true
+            for _, id in ipairs(ids) do if not got[id] then complete = false end end
+            if not complete then break end
+            out[#out+1] = msg; out[#out+1] = m[i + 1]; i = i + 2
+        else
+            out[#out+1] = msg; i = i + 1
+        end
+    end
+    if #out > 0 and out[#out].role == "user" then
+        out[#out+1] = {role="assistant", content="(The previous response was interrupted.)"}
+    end
+    return out
+end
+
 function hist.save(m)
-    ensureDir()
-    local t = m
-    if #m > MAX_MSG then t = {}; for i = #m - MAX_MSG + 1, #m do t[#t+1] = m[i] end end
-    local f = fs.open(H_FILE, "w"); if f then f.write(textutils.serialiseJSON(t)); f.close() end
+    if #m > MAX_MSG then hist.trim(m) end
+    local ok, json = pcall(textutils.serialiseJSON, m)
+    if not ok then return end
+    -- Write to a temp file first, so a full disk or crash never leaves an empty history.
+    local ok2 = pcall(function()
+        ensureDir()
+        local tmp = H_FILE .. ".tmp"
+        local f = fs.open(tmp, "w"); if not f then error("open failed") end
+        f.write(json); f.close()
+        if fs.exists(H_FILE) then fs.delete(H_FILE) end
+        fs.move(tmp, H_FILE)
+    end)
+    return ok2
 end
 
 function hist.load()
@@ -25,7 +107,8 @@ function hist.load()
     local f = fs.open(H_FILE, "r"); if not f then return nil end
     local c = f.readAll(); f.close()
     local ok, d = pcall(textutils.unserialiseJSON, c)
-    return (ok and type(d) == "table") and d or nil
+    if not (ok and type(d) == "table") then return nil end
+    return hist.sanitize(d)
 end
 
 function hist.clear()
@@ -351,7 +434,7 @@ function tools.getDefs()
         {name="delete_path", description="Delete file/dir.", input_schema={type="object",properties={path={type="string"}},required={"path"}}},
         {name="move_path", description="Move/rename.", input_schema={type="object",properties={from={type="string"},to={type="string"}},required={"from","to"}}},
         {name="get_info", description="System info: ID, fuel, peripherals.", input_schema={type="object",properties={}}},
-        {name="redstone", description="Redstone I/O.", input_schema={type="object",properties={action={type="string"},side={type="string"},value={type="number"}},required={"action","side"}}},
+        {name="redstone", description="Redstone I/O. Actions: getInput, getOutput, setOutput (value: true/false), getAnalogInput, setAnalogOutput (value: 0-15).", input_schema={type="object",properties={action={type="string"},side={type="string"},value={description="setOutput: true/false. setAnalogOutput: 0-15."}},required={"action","side"}}},
         {name="peripheral_call", description="Call peripheral method.", input_schema={type="object",properties={side={type="string"},method={type="string"},args={type="array",description="Arguments to pass"}},required={"side","method"}}},
         {name="get_recipes", description="Look up Minecraft recipes (crafting/smelting/smithing...) on the server. Needs an item or type filter. Exact output matches come first; results are capped. Shaped recipes have width, height and grid (row-major, 0 = empty, else 1-based index into ingredients). To craft on a turtle, use turtle_craft.", input_schema={type="object",properties={item={type="string",description="Output item (e.g. 'iron_pickaxe', 'minecraft:torch')"},type={type="string",description="Recipe type (e.g. 'crafting', 'smelting', 'smithing')"},limit={type="number",description="Max recipes (default 10, max 50)"}}}},
         {name="scan_inventory", description="Scan a container's inventory (chest, barrel, shulker box, etc.) via peripheral. Returns all items with slot, name, and count. Use with get_recipes to plan crafting sequences — find available materials across nearby chests, then craft intermediate and final items.", input_schema={type="object",properties={peripheral={type="string",description="Peripheral name or side (e.g. 'minecraft:chest_0', 'left')"},detailed={type="boolean",description="If true, fetch full item details per slot including displayName, nbt, tags (slower). Default: false"}},required={"peripheral"}}},
@@ -538,7 +621,13 @@ function tools._exec(name, input, ctx)
         local a,s = input.action, input.side
         if a=="getInput" then return {value=redstone.getInput(s)}
         elseif a=="getOutput" then return {value=redstone.getOutput(s)}
-        elseif a=="setOutput" then redstone.setOutput(s, input.value~=0); return {success=true}
+        elseif a=="setOutput" then
+            -- Claude may send true/false or 1/0; nil or false must never turn the output on.
+            local v = input.value
+            if type(v) == "number" then v = v ~= 0
+            elseif type(v) == "string" then v = (v == "true" or v == "1" or v == "on")
+            elseif type(v) ~= "boolean" then return {error="setOutput needs value: true/false (or 1/0)"} end
+            redstone.setOutput(s, v); return {success=true, value=v}
         elseif a=="getAnalogInput" then return {value=redstone.getAnalogInput(s)}
         elseif a=="setAnalogOutput" then redstone.setAnalogOutput(s, math.floor(input.value)); return {success=true}
         else return {error="Unknown: "..a} end
@@ -800,17 +889,14 @@ function tools._exec(name, input, ctx)
                 local ok2, data = turtle[s.action]()
                 if ok2 then result.blocks[#result.blocks+1] = {direction=s.dir, name=data.name, state=data.state} end
             end
-            -- Also inspect left, right, back by turning
-            turtle.turnLeft()
-            local ok2, data = turtle.inspect()
-            if ok2 then result.blocks[#result.blocks+1] = {direction="left", name=data.name, state=data.state} end
-            turtle.turnRight(); turtle.turnRight()
-            ok2, data = turtle.inspect()
-            if ok2 then result.blocks[#result.blocks+1] = {direction="right", name=data.name, state=data.state} end
-            turtle.turnRight(); turtle.turnRight()
-            ok2, data = turtle.inspect()
-            if ok2 then result.blocks[#result.blocks+1] = {direction="back", name=data.name, state=data.state} end
-            turtle.turnLeft() -- return to original facing
+            -- Also inspect right, back and left by turning right; the fourth turn
+            -- brings the turtle back to its original facing.
+            for _, dir in ipairs({"right", "back", "left"}) do
+                turtle.turnRight()
+                local ok2, data = turtle.inspect()
+                if ok2 then result.blocks[#result.blocks+1] = {direction=dir, name=data.name, state=data.state} end
+            end
+            turtle.turnRight()
             result.method = "turtle_inspect"
         else
             -- Standard computer: check peripherals
@@ -1224,6 +1310,7 @@ local function main()
 
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
         -- jobs.attachNotes prepends notes about jobs that ended since last turn
+        local turnStart = #msgs
         msgs[#msgs+1] = {role="user", content=jobs.attachNotes(inp)}
         sysPr = baseSysPr .. memory.promptSection() -- reload /.claude/memory.md every turn
 
@@ -1311,6 +1398,8 @@ local function main()
                 local responseText = ""
                 local toolCalls = {}
                 local done = false
+                local failed = nil -- error message, or "cancelled by the player"
+                local stopReason = nil
 
                 -- Collect streaming events
                 while not done do
@@ -1326,16 +1415,18 @@ local function main()
                         -- Will be completed by claude_tool_done
 
                     elseif ev == "claude_tool_done" and p1 == reqId then
-                        -- p2=toolId, p3=toolName, p4=inputJson
+                        -- p2=toolId, p3=toolName, p4=inputJson, p5=inputError (set when the
+                        -- streamed input was cut off or malformed: the tool must not run)
                         local input = {}
                         if p4 then
                             local ok2, parsed = pcall(textutils.unserialiseJSON, p4)
                             if ok2 and parsed then input = parsed end
                         end
-                        toolCalls[#toolCalls+1] = {id=p2, name=p3, input=input}
+                        toolCalls[#toolCalls+1] = {id=p2, name=p3, input=input, inputError=p5}
 
                     elseif ev == "claude_done" and p1 == reqId then
                         done = true
+                        stopReason = p2
                         term.setCursorPos(1,sH); term.clearLine()
                         -- p2=stopReason, p3=inputTokens (uncached), p4=outputTokens,
                         -- p5=cacheCreationTokens, p6=cacheReadTokens
@@ -1350,17 +1441,35 @@ local function main()
 
                     elseif ev == "claude_error" and p1 == reqId then
                         done = true
+                        failed = tostring(p2 or "unknown error")
                         term.setCursorPos(1,sH); term.clearLine()
-                        ui.add("Error: "..(p2 or "unknown"), C.err); ui.blank(); ui.drawBody()
-                        table.remove(msgs) -- remove failed user message
-                        break
+                        ui.add("Error: "..failed, C.err); ui.blank(); ui.drawBody()
 
                     elseif ev == "key" and p1 == keys.q then
                         claude.cancelRequest(reqId)
                         done = true
+                        failed = "cancelled by the player"
                         term.setCursorPos(1,sH); term.clearLine()
                         ui.add("(cancelled)", C.sep); ui.drawBody()
                     end
+                end
+
+                if failed then
+                    -- Never run tools from a failed or cancelled response, and leave the
+                    -- history in a shape the API accepts on the next turn.
+                    if failed ~= "cancelled by the player" and #msgs == turnStart + 1 then
+                        msgs[#msgs] = nil -- first round failed: drop the message so it can be retried
+                    else
+                        -- The player's message (and any finished tool rounds) stay; close the
+                        -- turn with an assistant note so roles alternate.
+                        local note = #responseText > 0 and (responseText .. "\n") or ""
+                        msgs[#msgs+1] = {role="assistant", content=note .. "(Response interrupted: "..failed..")"}
+                    end
+                    break
+                end
+
+                if #toolCalls > 0 and stopReason == "max_tokens" then
+                    ui.add("(Response hit the max_tokens limit; cut-off tool calls were not run.)", C.err)
                 end
 
                 if #toolCalls > 0 then
@@ -1375,10 +1484,20 @@ local function main()
                     -- Execute tools locally
                     local results = {}
                     for _, tc in ipairs(toolCalls) do
-                        showToolCall(tc.name, tc.input)
-                        local r = tools.exec(tc.name, tc.input, {reqId=reqId})
-                        showToolResult(tc.name, r)
-                        results[#results+1] = {type="tool_result", tool_use_id=tc.id, content=textutils.serialiseJSON(r)}
+                        local r
+                        if tc.inputError then
+                            -- Truncated/malformed input: running the tool with {} could do
+                            -- damage (e.g. write_file with no content). Report it instead.
+                            r = {error="Tool input was incomplete or invalid ("..tc.inputError.."), so the tool was not run. Retry with complete arguments."}
+                            showToolResult(tc.name, r)
+                        else
+                            showToolCall(tc.name, tc.input)
+                            r = tools.exec(tc.name, tc.input, {reqId=reqId})
+                            showToolResult(tc.name, r)
+                        end
+                        local ok3, rj = pcall(textutils.serialiseJSON, r)
+                        if not ok3 then rj = textutils.serialiseJSON({error="Tool result could not be encoded: "..tostring(rj)}) end
+                        results[#results+1] = {type="tool_result", tool_use_id=tc.id, content=rj, is_error=(type(r)=="table" and r.error ~= nil) or nil}
                     end
                     msgs[#msgs+1] = {role="user", content=results}
                     -- Continue loop for Claude to process results
@@ -1388,6 +1507,14 @@ local function main()
                     end
                     break
                 end
+            end
+
+            -- The turn must end on an assistant message: after the 15-round cap the last
+            -- message is a tool_result, and an empty final response adds nothing.
+            if #msgs > turnStart and msgs[#msgs].role == "user" then
+                local note = round >= 15 and "(Stopped after 15 tool rounds.)" or "(No response.)"
+                if round >= 15 then ui.add(note, C.sep); ui.drawBody() end
+                msgs[#msgs+1] = {role="assistant", content=note}
             end
         end
 
@@ -1429,8 +1556,13 @@ local function incomingMessageHandler()
             ui.drawBody()
 
         elseif ev == "claude_done" and p1 == "incoming" then
+            -- drawBody restores the cursor, so the player's half-typed input is untouched.
             ui.drawBody()
-            ui.drawInput()
+
+        elseif ev == "claude_error" and p1 == "incoming" then
+            ui.add("Incoming message failed: "..tostring(p2 or "unknown error"), C.err)
+            ui.blank()
+            ui.drawBody()
         end
     end
 end

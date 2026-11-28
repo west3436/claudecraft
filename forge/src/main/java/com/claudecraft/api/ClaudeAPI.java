@@ -41,7 +41,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *   -- API key mode (streaming):
  *   "claude_delta"      requestId, text
  *   "claude_tool_start" requestId, toolId, toolName
- *   "claude_tool_done"  requestId, toolId, toolName, inputJson
+ *   "claude_tool_done"  requestId, toolId, toolName, inputJson[, inputError]
+ *                       (inputError is set when the streamed input was cut off or
+ *                       malformed; inputJson is then "{}" and the tool must not run)
  *   "claude_done"       requestId, stopReason, inputTokens, outputTokens,
  *                       cacheCreationTokens, cacheReadTokens
  *                       (inputTokens is the uncached remainder; channel mode omits the cache fields)
@@ -692,8 +694,18 @@ public class ClaudeAPI implements ILuaAPI {
 
             @Override
             public void onToolUseComplete(String id, String name, JsonObject input) {
+                onToolUseComplete(id, name, input, null);
+            }
+
+            @Override
+            public void onToolUseComplete(String id, String name, JsonObject input,
+                                          String inputError) {
                 String inputJson = GSON.toJson(input);
-                queueEvent("claude_tool_done", requestId, id, name, inputJson);
+                if (inputError != null) {
+                    queueEvent("claude_tool_done", requestId, id, name, inputJson, inputError);
+                } else {
+                    queueEvent("claude_tool_done", requestId, id, name, inputJson);
+                }
             }
 
             @Override
