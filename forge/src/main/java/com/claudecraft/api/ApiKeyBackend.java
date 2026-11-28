@@ -1,6 +1,7 @@
 package com.claudecraft.api;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -62,8 +63,8 @@ public class ApiKeyBackend implements ClaudeBackend {
             return handle;
         }
 
-        String apiKey = ClaudeCraftConfig.API_KEY.get();
-        if (apiKey == null || apiKey.isEmpty()) {
+        String apiKey = ApiKeyProvider.get();
+        if (!ApiKeyProvider.isValidFormat(apiKey)) {
             activeRequests.decrementAndGet();
             callbacks.onError("API key not configured. Use /claudecraft setkey <key>");
             return handle;
@@ -156,8 +157,7 @@ public class ApiKeyBackend implements ClaudeBackend {
 
     @Override
     public boolean isConfigured() {
-        String key = ClaudeCraftConfig.API_KEY.get();
-        return key != null && !key.isEmpty() && key.startsWith("sk-");
+        return ApiKeyProvider.isConfigured();
     }
 
     @Override

@@ -121,6 +121,7 @@ function progress.track(toolName, result)
     p.tools_used = (p.tools_used or 0) + 1
     if toolName == "turtle_dig" and result and result.success then p.blocks_mined = (p.blocks_mined or 0) + 1
     elseif toolName == "turtle_place" and result and result.success then p.blocks_placed = (p.blocks_placed or 0) + 1
+    elseif toolName == "build_structure" and result and result.placed then p.blocks_placed = (p.blocks_placed or 0) + result.placed
     elseif toolName == "write_file" and result and result.success then p.files_written = (p.files_written or 0) + 1
     elseif toolName == "run_command" then p.commands_run = (p.commands_run or 0) + 1
     elseif toolName == "turtle_move" and result and result.results then p.moves = (p.moves or 0) + (result.completed or 0)
@@ -234,7 +235,7 @@ function ui.drawBody()
 end
 
 function ui.drawMonitor()
-    if not monitor then return end
+    if not monitor or ui.monitorHold then return end
     local mW, mH = monitor.getSize()
     local mAdv = monitor.isColour and monitor.isColour() or false
     monitor.setBackgroundColour(C.bg); monitor.clear()
@@ -309,6 +310,7 @@ function ui.readInput()
     term.clearLine(); term.write("> "); term.setCursorPos(3,sH); term.setCursorBlink(true)
     local inp = read(nil, inpHist)
     term.setCursorBlink(false)
+    ui.monitorHold = nil -- resume mirroring chat after a build preview
     if inp and #inp > 0 then inpHist[#inpHist+1] = inp end
     return inp
 end
@@ -322,6 +324,8 @@ end
 ----------------------------------------------------------------------
 -- TOOLS (same as standalone, executed Lua-side)
 ----------------------------------------------------------------------
+local memory = require("claudecraft.memory") -- per-computer memory: /.claude/memory.md
+local atlas = require("claudecraft.atlas")   -- shared, world-saved base atlas
 local tools = {}
 local guard = require("claudecraft.guard") -- confirm mode + hard limits for destructive tools
 
@@ -363,13 +367,54 @@ function tools.getDefs()
         d[#d+1] = {name="turtle_place", description="Place: place/placeUp/placeDown.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inspect", description="Inspect: inspect/inspectUp/inspectDown/detect*.", input_schema={type="object",properties={action={type="string"}},required={"action"}}}
         d[#d+1] = {name="turtle_inventory", description="Inventory: select/getItemDetail/refuel/drop/suck/etc.", input_schema={type="object",properties={action={type="string"},slot={type="number"},count={type="number"}},required={"action"}}}
-        d[#d+1] = {name="build_structure", description="Execute a multi-block build from a blueprint. Provide blocks as relative coords from turtle's current position. Turtle navigates, selects matching inventory items, and places each block. Uses bottom-up layer-by-layer construction. Block names must match inventory item names (e.g. 'minecraft:oak_planks').", input_schema={type="object",properties={blocks={type="array",description="Block placements: {x,y,z,block} relative to turtle start pos",items={type="object",properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"}},required={"x","y","z","block"}}}},required={"blocks"}}}
+        local P = {x={type="number"},y={type="number"},z={type="number"}}
+        local FACE = {type="string", enum={"forward","right","back","left"}, description="Turtle facing when placing (stairs ascend toward it). Roof stairs face up-slope automatically."}
+        d[#d+1] = {name="build_structure",
+            description="Build from shape primitives and/or single blocks. COORDINATES ARE RELATIVE to the turtle's position and facing when called: x=right, y=up, z=forward; (0,0,0) is the turtle's own cell, so y=0 is its level and y=-1 the block under it. This is NOT the world/GPS frame turtle_goto uses. " ..
+                "Shapes apply in order (later ones overwrite earlier ones), then 'blocks'. Block 'air' carves cells out (doors, windows); it never digs. " ..
+                "Builds bottom-up, placing each block from above. Never digs blocks it placed; returns to the start, or parks beside the build if it can't, and reports position, facing and home. " ..
+                "Run dry_run=true first: bounding box, per-material need/have/short and a fuel estimate, without moving. A real run refuses if fuel is short and stops cleanly if it runs low. " ..
+                "Existing blocks in target cells are kept and reported unless replace=true; blocks dug while moving are reported. Blocks are item ids (e.g. minecraft:stone_bricks). Doors, beds and other 2-block items can't be placed this way.",
+            input_schema={type="object", properties={
+                shapes={type="array", description="Shape primitives, applied in order", items={type="object", properties={
+                    type={type="string", enum={"box","hollow_box","wall","line","floor","plane","cylinder","sphere","dome","roof"}, description="box, hollow_box, floor/plane, wall, line, roof use from+to (inclusive). cylinder, sphere, dome use center+radius. floor/plane is horizontal at from.y. wall runs from->to horizontally (diagonals ok), filled from.y..to.y. roof is a gable roof over the from..to footprint starting at from.y."},
+                    block={type="string", description="Item id, or 'air' to carve"},
+                    from={type="object", description="{x,y,z} corner or start", properties=P},
+                    to={type="object", description="{x,y,z} opposite corner or end", properties=P},
+                    center={type="object", description="{x,y,z}. For a cylinder, the middle of its bottom layer.", properties=P},
+                    radius={type="number"},
+                    height={type="number", description="cylinder: layers (default 1). wall: height from from.y instead of to.y."},
+                    hollow={type="boolean", description="cylinder/sphere/dome: shell only (default false, dome true)"},
+                    open={type="array", items={type="string", enum={"top","bottom","left","right","front","back"}}, description="hollow_box faces to leave out"},
+                    axis={type="string", enum={"x","z"}, description="roof ridge direction (default: the longer side)"},
+                    gable_block={type="string", description="roof: also fill the triangular gable ends with this block"},
+                    facing=FACE,
+                }, required={"type","block"}}},
+                blocks={type="array", description="Single blocks {x,y,z,block}, applied after shapes", items={type="object", properties={x={type="number"},y={type="number"},z={type="number"},block={type="string"},facing=FACE}, required={"x","y","z","block"}}},
+                dry_run={type="boolean", description="Plan only; the turtle does not move"},
+                replace={type="boolean", description="Dig and replace existing blocks in target cells (default false)"},
+                restock_chest={type="string", enum={"back","down","up","left","right","front"}, description="Inventory next to the start position. When a material runs out the turtle goes back, refills, returns unneeded items, and resumes. Keep only build materials in it."},
+                preview={type="string", enum={"monitor","text","both"}, description="monitor: draw each layer on an attached monitor. text: ASCII layers in the result."},
+                preview_monitor={type="string", description="Monitor peripheral name (default: one that isn't mirroring the chat)"},
+            }}}
         d[#d+1] = {name="turtle_goto", description="Navigate to coordinates using GPS + pathfinding. Digs through obstacles. Requires GPS satellites.", input_schema={type="object",properties={x={type="number",description="Target X"},y={type="number",description="Target Y"},z={type="number",description="Target Z"}},required={"x","y","z"}}}
     end
     if logistics then for _, def in ipairs(logistics.getDefs()) do d[#d+1] = def end end
+    for _, def in ipairs(memory.toolDefs()) do d[#d+1] = def end -- remember, forget
+    for _, def in ipairs(atlas.toolDefs()) do d[#d+1] = def end  -- set/list/remove_waypoint, atlas_search
     jobs.addDefs(d)
     return d
 end
+
+-- getDefs() is the single tool registry for both modes: channel mode gets it via
+-- claude.startChannel. Channel-mode tool timeout overrides in seconds (they only
+-- extend the toolTimeoutSeconds config). Add an entry for any long-running tool.
+tools.timeouts = {
+    -- ~3300 moves/placements at build.lua's 0.45s/op estimate. Kept under Claude Code's
+    -- ~30 min idle limit for a silent stdio MCP call; bigger builds belong in a background job.
+    build_structure = 1500,
+    turtle_goto = 300,
+}
 
 -- ctx: {reqId=request the caller is streaming, remote=true for another computer's message}
 function tools.exec(name, input, ctx)
@@ -379,12 +424,15 @@ function tools.exec(name, input, ctx)
         function(n, i) return tools._exec(n, i, ctx) end)
     if not ok then return {error=tostring(r)} end
     if not blocked then progress.track(name, r) end
+    if not blocked then atlas.observe(name, input, r) end -- index scan_inventory results in the base atlas
     return r
 end
 
 function tools._exec(name, input, ctx)
     if jobs.handles(name) then return jobs.exec(name, input, ctx) end
     if logistics and logistics.handlers[name] then return logistics.handlers[name](input) end
+    local ext = memory.exec(name, input) or atlas.exec(name, input) -- module-provided tools
+    if ext then return ext end
     if name == "read_file" then
         if not fs.exists(input.path) then return {error="Not found: "..input.path} end
         if fs.isDir(input.path) then return {error="Is a directory"} end
@@ -522,138 +570,14 @@ function tools._exec(name, input, ctx)
             return {error="Unknown: "..a}
         end
     elseif name == "build_structure" then
+        -- Shapes, dry run, safe routing and restock: rom/modules/main/claudecraft/build.lua
         if not turtle then return {error="Not a turtle"} end
-        local blocks = input.blocks
-        if not blocks or #blocks == 0 then return {error="No blocks in blueprint"} end
-
-        -- Position and facing state (relative to start)
-        local px, py, pz = 0, 0, 0
-        -- Facing: 0=+z(forward), 1=+x(right), 2=-z(back), 3=-x(left)
-        local face = 0
-        local dxMap = {[0]=0, [1]=1, [2]=0, [3]=-1}
-        local dzMap = {[0]=1, [1]=0, [2]=-1, [3]=0}
-
-        local function turnTo(dir)
-            dir = dir % 4
-            while face ~= dir do
-                local diff = (dir - face) % 4
-                if diff == 1 then
-                    turtle.turnRight()
-                    face = (face + 1) % 4
-                else
-                    turtle.turnLeft()
-                    face = (face + 3) % 4
-                end
-            end
-        end
-
-        local function tryForward()
-            if turtle.forward() then
-                px = px + dxMap[face]
-                pz = pz + dzMap[face]
-                return true
-            end
-            return false
-        end
-
-        local function tryUp()
-            if turtle.up() then py = py + 1; return true end
-            return false
-        end
-
-        local function tryDown()
-            if turtle.down() then py = py - 1; return true end
-            return false
-        end
-
-        local function digForward()
-            turtle.dig()
-            return tryForward()
-        end
-
-        local function digUp()
-            turtle.digUp()
-            return tryUp()
-        end
-
-        local function digDown()
-            turtle.digDown()
-            return tryDown()
-        end
-
-        local function goTo(tx, ty, tz)
-            -- Move Y first (up before horizontal to clear obstacles)
-            while py < ty do if not tryUp() then if not digUp() then return false end end end
-            while py > ty do if not tryDown() then if not digDown() then return false end end end
-            -- Move X
-            if px ~= tx then
-                if px < tx then turnTo(1) else turnTo(3) end
-                while px ~= tx do if not tryForward() then if not digForward() then return false end end end
-            end
-            -- Move Z
-            if pz ~= tz then
-                if pz < tz then turnTo(0) else turnTo(2) end
-                while pz ~= tz do if not tryForward() then if not digForward() then return false end end end
-            end
-            return true
-        end
-
-        local function findSlot(blockName)
-            for s = 1, 16 do
-                local item = turtle.getItemDetail(s)
-                if item and (item.name == blockName or item.name == "minecraft:"..blockName or "minecraft:"..item.name == blockName) then
-                    if turtle.getItemCount(s) > 0 then return s end
-                end
-            end
-            return nil
-        end
-
-        -- Sort blocks: bottom-up by Y, then serpentine X/Z for efficiency
-        table.sort(blocks, function(a, b)
-            if a.y ~= b.y then return a.y < b.y end
-            -- Serpentine: alternate Z direction per X row
-            if a.x ~= b.x then return a.x < b.x end
-            if a.x % 2 == 0 then return a.z < b.z
-            else return a.z > b.z end
-        end)
-
-        local placed = 0
-        local failed = {}
-        local missing = {}
-
-        for i, block in ipairs(blocks) do
-            local slot = findSlot(block.block)
-            if not slot then
-                missing[#missing+1] = {x=block.x, y=block.y, z=block.z, block=block.block}
-            else
-                turtle.select(slot)
-                -- Navigate to one above target and place down
-                if goTo(block.x, block.y + 1, block.z) then
-                    -- Dig down if something is in the way
-                    if turtle.detectDown() then turtle.digDown() end
-                    if turtle.placeDown() then
-                        placed = placed + 1
-                    else
-                        failed[#failed+1] = {x=block.x, y=block.y, z=block.z, reason="place failed"}
-                    end
-                else
-                    failed[#failed+1] = {x=block.x, y=block.y, z=block.z, reason="nav failed"}
-                end
-            end
-            -- Yield periodically to avoid "too long without yielding"
-            if i % 10 == 0 then os.queueEvent("bp_yield"); os.pullEvent("bp_yield") end
-        end
-
-        -- Return to origin
-        goTo(0, math.max(py, 1), 0)
-        goTo(0, 0, 0)
-        turnTo(0)
-
-        return {
-            total=#blocks, placed=placed,
-            failed=#failed > 0 and failed or nil,
-            missing=#missing > 0 and missing or nil
-        }
+        return require("claudecraft.build").handle(input, {
+            log = function(s) ui.add("  "..s, C.info); ui.drawBody() end,
+            chatMonitor = monSide,
+            -- a preview drawn on the chat mirror monitor stays up until the next prompt
+            onPreview = function(n) if n == monSide then ui.monitorHold = true end end,
+        })
     elseif name == "turtle_goto" then
         if not turtle then return {error="Not a turtle"} end
         local tx, ty, tz = input.x, input.y, input.z
@@ -1010,7 +934,8 @@ if backendMode == "channel" then
     local ok, portOrErr = claude.startChannel(
         turtle ~= nil,
         os.getComputerLabel() or "Computer",
-        sW, sH
+        sW, sH,
+        tools.getDefs(), tools.timeouts
     )
 
     if not ok then
@@ -1087,6 +1012,7 @@ sysPr = sysPr .. string.format(
     (claude.isWebAccessEnabled() and http) and "HTTP requests, " or "",
     turtle and "turtle control, " or "")
 sysPr = sysPr .. jobs.promptHint()
+local baseSysPr = sysPr -- memory.promptSection() is appended fresh each user turn
 
 local toolDefs = tools.getDefs()
 
@@ -1193,6 +1119,37 @@ local function main()
         if not inp or inp == "exit" or inp == "quit" then break end
         if #inp == 0 then goto continue end
 
+        -- Inter-computer message allowlist (channel mode): /allow, /deny, /allowlist
+        do
+            local acmd, arest = inp:match("^/(%a+)%s*(.*)$")
+            if acmd == "allow" or acmd == "deny" or acmd == "allowlist" then
+                local ids, bad = {}, false
+                for tok in arest:gmatch("%S+") do
+                    local n = tonumber(tok)
+                    if n and n >= 0 and n == math.floor(n) then ids[#ids+1] = n else bad = true end
+                end
+                if acmd ~= "allowlist" and (bad or #ids == 0) then
+                    ui.add("Usage: /"..acmd.." <computer id> [more ids]", C.err)
+                else
+                    if acmd ~= "allowlist" then
+                        local set = {}
+                        for _, id in ipairs(claude.getMessageAllowlist()) do set[id] = true end
+                        for _, id in ipairs(ids) do set[id] = (acmd == "allow") or nil end
+                        local list = {}
+                        for id in pairs(set) do list[#list+1] = id end
+                        local ok, err = pcall(claude.setMessageAllowlist, list)
+                        if not ok then ui.add("Error: "..tostring(err), C.err) end
+                    end
+                    local shown = {}
+                    for i, id in ipairs(claude.getMessageAllowlist()) do shown[i] = "#"..id end
+                    if #shown == 0 then ui.add("No computer may message this one.", C.info)
+                    else ui.add("Accepting messages from: "..table.concat(shown, ", "), C.info) end
+                    ui.add("/allow <id> or /deny <id> to change.", C.sep)
+                end
+                ui.blank(); ui.drawBody(); goto continue
+            end
+        end
+
         if inp == "/clear" then msgs={}; hist.clear(); ui.clear(); ui.add("Cleared.", C.info); ui.drawBody(); goto continue end
         if inp == "/mode" then
             fs.delete(MODE_FILE)
@@ -1208,6 +1165,7 @@ local function main()
             ui.add("  /search X - Search chat history", C.ai)
             ui.add("  /progress - Achievement stats", C.ai)
             ui.add("  /jobs     - Background jobs", C.ai)
+            ui.add("  /memory   - Show memory (/memory clear)", C.ai)
             ui.add("  /confirm  - Ask before risky tools", C.ai)
             ui.add("  /help     - This help", C.ai)
             ui.add("  exit      - Quit", C.ai)
@@ -1259,9 +1217,12 @@ local function main()
             ui.blank(); ui.drawBody(); goto continue
         end
 
+        if inp == "/memory" or inp:match("^/memory%s") then memory.command(inp, ui, C); goto continue end
+
         ui.add("> "..inp, C.user); ui.blank(); ui.drawBody()
         -- jobs.attachNotes prepends notes about jobs that ended since last turn
         msgs[#msgs+1] = {role="user", content=jobs.attachNotes(inp)}
+        sysPr = baseSysPr .. memory.promptSection() -- reload /.claude/memory.md every turn
 
         if backendMode == "channel" then
             ----------------------------------------------------------------

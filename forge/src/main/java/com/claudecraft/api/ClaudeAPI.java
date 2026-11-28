@@ -3,6 +3,7 @@ package com.claudecraft.api;
 import com.claudecraft.ClaudeCraft;
 import com.claudecraft.channel.ChannelAccess;
 import com.claudecraft.channel.ChannelProcessManager;
+import com.claudecraft.config.ApiKeyProvider;
 import com.claudecraft.config.ClaudeCraftConfig;
 import com.google.gson.*;
 import dan200.computercraft.api.lua.*;
@@ -25,13 +26,16 @@ import java.util.concurrent.atomic.AtomicLong;
  * Lua API:
  *   claude.isApiKeyConfigured()                   -> boolean
  *   claude.getModel()                             -> string
- *   claude.startChannel(isTurtle, label, w, h)    -> success, errorOrPort
+ *   claude.startChannel(isTurtle, label, w, h, toolDefs, toolTimeouts)
+ *                                                 -> success, errorOrPort
  *   claude.stopChannel()                          -> nil
  *   claude.isChannelReady()                       -> boolean
  *   claude.sendMessage(messages, tools, system)   -> requestId (string)
  *   claude.sendToolResult(reqId, callId, result)  -> nil
  *   claude.cancelRequest(requestId)               -> nil
  *   claude.getRecipes(item, type, limit, maxAlts) -> JSON string (needs item or type filter)
+ *   claude.getMessageAllowlist()                  -> {computerId, ...}
+ *   claude.setMessageAllowlist({computerId, ...}) -> {computerId, ...} (as stored)
  *
  * Events pushed to the computer:
  *   -- API key mode (streaming):
@@ -101,8 +105,7 @@ public class ClaudeAPI implements ILuaAPI {
      */
     @LuaFunction
     public final boolean isApiKeyConfigured() {
-        String key = ClaudeCraftConfig.API_KEY.get();
-        return key != null && !key.isEmpty() && key.startsWith("sk-");
+        return ApiKeyProvider.isConfigured();
     }
 
     /**
@@ -147,7 +150,13 @@ public class ClaudeAPI implements ILuaAPI {
      * The label is read from the computer itself; the Lua label argument is
      * ignored.
      *
-     * @param args Lua arguments: isTurtle (boolean), label (string, ignored), termW (int), termH (int)
+     * <p>{@code toolDefs} is the same table API-key mode passes to sendMessage
+     * (claude.lua's tools.getDefs()). It is the channel server's tool list, so
+     * every Lua tool is available in both modes. {@code toolTimeouts} maps tool
+     * names to timeout overrides in seconds for long-running tools.
+     *
+     * @param args Lua arguments: isTurtle (boolean), label (string, ignored), termW (int), termH (int),
+     *             toolDefs (table|nil), toolTimeouts (table|nil)
      * @return {success: boolean, portOrError: number|string}
      */
     @LuaFunction
@@ -155,6 +164,24 @@ public class ClaudeAPI implements ILuaAPI {
         boolean isTurtle = args.optBoolean(0).orElse(false);
         int termW = args.optInt(2).orElse(51);
         int termH = args.optInt(3).orElse(19);
+        JsonArray toolDefs = args.optTable(4).map(this::luaMapToJsonArray).orElseGet(JsonArray::new);
+        if (!toolDefs.isEmpty()) {
+            // Same server policy as API-key mode (http_request needs enableWebAccess).
+            // Anthropic-run server tools can't be served over MCP, so they are always dropped.
+            toolDefs = ToolPolicy.apply(toolDefs, false,
+                    ClaudeCraftConfig.ENABLE_WEB_ACCESS.get(), computer.getID());
+        }
+        JsonObject toolTimeouts = new JsonObject();
+        args.optTable(5).ifPresent(t -> {
+            JsonElement el = luaValueToJson(t, null);
+            if (el.isJsonObject()) {
+                el.getAsJsonObject().entrySet().forEach(e -> {
+                    if (e.getValue().isJsonPrimitive() && e.getValue().getAsJsonPrimitive().isNumber()) {
+                        toolTimeouts.add(e.getKey(), e.getValue());
+                    }
+                });
+            }
+        });
 
         int computerId = computer.getID();
 
@@ -162,6 +189,11 @@ public class ClaudeAPI implements ILuaAPI {
         if (refusal != null) {
             ClaudeCraft.LOGGER.info("Refused channel session for computer #{}: {}", computerId, refusal);
             return new Object[]{false, refusal};
+        }
+
+        if (toolDefs.isEmpty()) {
+            ClaudeCraft.LOGGER.warn("startChannel for computer #{} got no tool defs; "
+                    + "only reply/send_message will be available", computerId);
         }
 
         // Label from the computer, not from Lua; the manager sanitizes it
@@ -178,9 +210,9 @@ public class ClaudeAPI implements ILuaAPI {
         try {
             ChannelProcessManager.SessionInfo session =
                     ChannelProcessManager.getInstance().startSession(
-                            computerId, isTurtle, label, termW, termH);
+                            computerId, isTurtle, label, termW, termH, toolDefs, toolTimeouts);
 
-            ChannelBackend backend = new ChannelBackend(session.port);
+            ChannelBackend backend = new ChannelBackend(session.port, session.token, computerId);
 
             // Start a persistent global SSE listener for incoming inter-computer messages.
             backend.connectGlobalSSE(createChannelCallbacks("incoming"));
@@ -255,6 +287,59 @@ public class ClaudeAPI implements ILuaAPI {
     }
 
     /**
+     * Computer IDs allowed to send inter-computer messages to this computer
+     * (channel mode). Empty by default: all incoming messages are rejected.
+     */
+    @LuaFunction
+    public final Map<Integer, Integer> getMessageAllowlist() throws LuaException {
+        return toLuaList(com.claudecraft.channel.MessageAllowlist.get(allowlistDir()));
+    }
+
+    /**
+     * Replace this computer's message allowlist. Takes a list of computer IDs and
+     * returns the list as stored (sorted, duplicates removed). Takes effect for the
+     * next incoming message; no session restart needed.
+     */
+    @LuaFunction
+    public final Map<Integer, Integer> setMessageAllowlist(@NotNull IArguments args) throws LuaException {
+        Map<?, ?> table = args.getTable(0);
+        List<Integer> ids = new ArrayList<>();
+        for (Object value : table.values()) {
+            if (!(value instanceof Number n) || n.doubleValue() != Math.floor(n.doubleValue())
+                    || n.doubleValue() < 0 || n.doubleValue() > Integer.MAX_VALUE) {
+                throw new LuaException("Computer IDs must be non-negative integers");
+            }
+            ids.add(n.intValue());
+        }
+        java.nio.file.Path dir = allowlistDir();
+        try {
+            return toLuaList(com.claudecraft.channel.MessageAllowlist.set(dir, ids));
+        } catch (IllegalArgumentException e) {
+            throw new LuaException(e.getMessage());
+        } catch (Exception e) {
+            ClaudeCraft.LOGGER.warn("Failed to save message allowlist for computer #{}",
+                    computer.getID(), e);
+            throw new LuaException("Could not save allowlist: " + e.getMessage());
+        }
+    }
+
+    /** This computer's sandbox in the current world, where its message allowlist lives. */
+    private java.nio.file.Path allowlistDir() throws LuaException {
+        try {
+            return ChannelProcessManager.getInstance().sandboxDir(computer.getID());
+        } catch (Exception e) {
+            throw new LuaException("Message allowlist unavailable: " + e.getMessage());
+        }
+    }
+
+    /** 1-indexed map, which CC:Tweaked returns to Lua as a list. */
+    private static Map<Integer, Integer> toLuaList(List<Integer> ids) {
+        Map<Integer, Integer> out = new HashMap<>();
+        for (int i = 0; i < ids.size(); i++) out.put(i + 1, ids.get(i));
+        return out;
+    }
+
+    /**
      * Send a message to Claude. Returns immediately with a request ID.
      * Automatically routes to the active backend (API key or channel).
      *
@@ -304,9 +389,10 @@ public class ClaudeAPI implements ILuaAPI {
         JsonArray messagesJson = luaMapToJsonArray(messagesTable);
         request.add("messages", messagesJson);
 
-        // Convert tools Lua table to JSON array if provided (API key mode only)
+        // Convert tools Lua table to JSON array if provided (API key mode only).
+        // ToolPolicy enforces allowServerTools / enableWebAccess for every caller, not just claude.lua.
         if (toolsOpt.isPresent() && !useChannel) {
-            JsonArray toolsJson = luaMapToJsonArray(toolsOpt.get());
+            JsonArray toolsJson = ToolPolicy.apply(luaMapToJsonArray(toolsOpt.get()), computer.getID());
             request.add("tools", toolsJson);
         }
 
@@ -524,6 +610,67 @@ public class ClaudeAPI implements ILuaAPI {
             }
         }
         return recipeObj;
+    }
+
+    // -- Shared base atlas (world-saved; logic in com.claudecraft.atlas.AtlasLua) --
+    //   claude.atlasSetWaypoint{name, x?, y?, z?, dimension?, note?, group?}  -> {waypoint, replaced, group}
+    //   claude.atlasListWaypoints{group?, filter?}                            -> {waypoints, count, total, group}
+    //   claude.atlasRemoveWaypoint(name, group?)                              -> {removed, waypoint?, group}
+    //   claude.atlasSearch(query, group?) / {query, group?, limit?}           -> {matches, totals, waypoints, ...}
+    //   claude.atlasRecordInventory{peripheral, items, size?, group?}         -> {key, exact, x, y, z, ...}
+    // Omitting x/y/z in atlasSetWaypoint uses this computer's position. Groups default to "default".
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasSetWaypoint(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.setWaypoint(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasListWaypoints(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.listWaypoints(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasRemoveWaypoint(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.removeWaypoint(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasSearch(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.search(computer, args);
+    }
+
+    @LuaFunction(mainThread = true)
+    public final Map<String, Object> atlasRecordInventory(IArguments args) throws LuaException {
+        return com.claudecraft.atlas.AtlasLua.recordInventory(computer, args);
+    }
+
+    /**
+     * Turtle helper: is a player standing in the block next to this turtle?
+     * build_structure calls this before attacking whatever blocks a move, so it
+     * hits mobs but only waits for players. Lua: claude.isPlayerBlocking(dir).
+     *
+     * @param direction "front", "back", "up" or "down"
+     * @return true if a (non-spectator) player's hitbox overlaps that block
+     */
+    @LuaFunction(mainThread = true)
+    public final boolean isPlayerBlocking(String direction) throws LuaException {
+        // Fully qualified names keep this helper self-contained (no import churn).
+        dan200.computercraft.api.turtle.ITurtleAccess turtle =
+                computer.getComponent(dan200.computercraft.api.component.ComputerComponents.TURTLE);
+        if (turtle == null) throw new LuaException("Not a turtle");
+        net.minecraft.core.Direction dir = switch (direction) {
+            case "front", "forward" -> turtle.getDirection();
+            case "back" -> turtle.getDirection().getOpposite();
+            case "up", "top" -> net.minecraft.core.Direction.UP;
+            case "down", "bottom" -> net.minecraft.core.Direction.DOWN;
+            default -> throw new LuaException("Unknown direction: " + direction);
+        };
+        net.minecraft.core.BlockPos pos = turtle.getPosition().relative(dir);
+        net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+                pos.getX(), pos.getY(), pos.getZ(), pos.getX() + 1, pos.getY() + 1, pos.getZ() + 1);
+        return !turtle.getLevel().getEntitiesOfClass(
+                net.minecraft.world.entity.player.Player.class, box, p -> !p.isSpectator()).isEmpty();
     }
 
     // -- Callback factories --

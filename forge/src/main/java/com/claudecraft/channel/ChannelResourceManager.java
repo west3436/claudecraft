@@ -1,6 +1,7 @@
 package com.claudecraft.channel;
 
 import com.claudecraft.ClaudeCraft;
+import com.claudecraft.config.ApiKeyProvider;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -101,9 +102,10 @@ public class ChannelResourceManager {
 
     private boolean isBunInstalled() {
         try {
-            Process p = new ProcessBuilder("bun", "--version")
-                    .redirectErrorStream(true)
-                    .start();
+            ProcessBuilder pb = new ProcessBuilder("bun", "--version")
+                    .redirectErrorStream(true);
+            pb.environment().remove(ApiKeyProvider.ENV_VAR);
+            Process p = pb.start();
             int exitCode = p.waitFor();
             return exitCode == 0;
         } catch (Exception e) {
@@ -116,6 +118,8 @@ public class ChannelResourceManager {
             ProcessBuilder pb = new ProcessBuilder("bun", "install")
                     .directory(channelDir.toFile())
                     .redirectErrorStream(true);
+            // bun install runs package scripts; keep the API key out of their reach
+            pb.environment().remove(ApiKeyProvider.ENV_VAR);
             Process p = pb.start();
 
             // Read output

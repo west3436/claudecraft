@@ -115,6 +115,8 @@ When you select Channel mode on a CC:Tweaked computer:
 
 Each computer has its own Claude Code session, sandbox folder and port. The computer's label is read by the mod itself, stripped of line breaks and control characters, and shortened to 32 characters before it goes into any generated file.
 
+Channel mode offers the same tools as API key mode. The in-game `claude` program passes its tool list (`tools.getDefs()` in `claude.lua`) to the mod, which writes it to `tools.json` in the sandbox, and the channel server serves it to Claude Code. The system prompt (your `personality` and `systemPromptPrefix` config) goes with the first message and again whenever it changes. Tools time out after `toolTimeoutSeconds`. Long tools such as `build_structure` and `turtle_goto` get more time.
+
 ### Session lifecycle
 
 - The mod tracks each session by the process ID of its launcher (the console window on Windows, `script` elsewhere) and kills that whole process tree when the session stops.
@@ -195,7 +197,7 @@ Yes. Each computer independently chooses its mode. One computer can use API key 
   - `channel-registry.json`: which port each computer's channel server uses (for `send_message`)
   - `sessions.json`: each session's process ID, used to clean up after a crash
 - Per-computer sandboxes: `~/.claudecraft/worlds/<world>/computers/<id>/`
-- Each sandbox contains: `CLAUDE.md`, `.mcp.json`, `.claude/settings.local.json`, and on Windows `launch-claude.bat`
+- Each sandbox contains: `CLAUDE.md`, `.mcp.json`, `tools.json` (the computer's tool list), `.claude/settings.local.json`, and on Windows `launch-claude.bat`
 
 Older versions used `~/.claudecraft/computers/<id>/`, shared by every world. Those folders are no longer used and can be deleted. After upgrading, each computer starts in a new sandbox folder, so Claude Code asks for trust again.
 
@@ -224,6 +226,22 @@ Channel mode needs Bun and Claude Code installed on the server machine, and Clau
 - **Linux and macOS**: sessions run headless under a pseudo-terminal, with no window. If Claude Code stops at a prompt on first start (such as the folder trust prompt), nobody can answer it from the game. Run `claude` once from a terminal in that computer's sandbox folder, accept the prompt, then run `claude` in-game again.
 
 Read [Security](#security) first: every player who can reach an allowed computer uses the server owner's Claude account.
+
+### Can computers send each other messages?
+
+Yes, with `send_message`, but a computer only accepts messages from computers its player has allowed. By default it accepts none. In the `claude` program on the receiving computer:
+
+- `/allow 12` accepts messages from computer #12 (several IDs at once work too: `/allow 12 13 14`)
+- `/deny 12` stops accepting them
+- `/allowlist` shows who is allowed
+
+Programs can do the same with `claude.getMessageAllowlist()` and `claude.setMessageAllowlist({12, 13})`. For two computers to talk both ways, each must allow the other.
+
+Claude treats a message from another computer as a request from a peer, not as an instruction from the player. Chains of messages are limited to 3 hops (player → A → B → C), and each sender may deliver at most 5 messages per minute to a computer. A computer that is busy with its player's request rejects messages until it is done.
+
+### Is the channel server reachable by other programs?
+
+Only by ClaudeCraft. Each session's server listens on `127.0.0.1` and requires a random per-session token that the mod generates. It rejects requests from web browsers, so a web page you have open cannot talk to it.
 
 ## Troubleshooting
 

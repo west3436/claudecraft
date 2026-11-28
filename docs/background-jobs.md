@@ -5,7 +5,7 @@ with Claude, and that can pick up where it left off after a reboot or chunk
 reload. Claude starts jobs with tools; you watch and control them from the
 status line and the `/jobs` command.
 
-## Tools (Lua backend)
+## Tools (API key and channel mode)
 
 | Tool | Purpose |
 |------|---------|
@@ -122,8 +122,6 @@ left.
 
 - No chunk loading: jobs only run while the turtle's chunk is loaded. A
   chunk unload or server restart pauses the job like a reboot does.
-- Channel mode does not offer the job tools yet; its tool list is defined
-  separately from the Lua tool list.
 - The turn rule above is a guess, and two cases defeat it:
   - a computer shut down and switched back on more than 10 seconds later
     while its chunk stayed loaded;
